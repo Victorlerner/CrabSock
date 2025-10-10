@@ -29,6 +29,18 @@ interface LogEntry {
   source: 'frontend' | 'backend'
 }
 
+interface AppSettings {
+  use_system_proxy: boolean
+  autorun: boolean
+  split_http_only: boolean
+  tun_mode: boolean
+}
+
+interface ConfigFile {
+  configs: ParsedConfig[]
+  settings: AppSettings
+}
+
 export const useVpnStore = defineStore('vpn', {
   state: () => ({
     status: 'disconnected' as Status,
@@ -43,10 +55,12 @@ export const useVpnStore = defineStore('vpn', {
     error: null as string | null,
     showLogs: false,
     settings: {
-      useSystemProxy: false,
+      use_system_proxy: false,
       autorun: false,
-      splitHttpOnly: false,
+      split_http_only: false,
+      tun_mode: false,
     },
+    configPath: '',
   }),
   actions: {
     addLog(level: 'info' | 'warn' | 'error', message: string, source: 'frontend' | 'backend' = 'frontend') {
@@ -72,7 +86,21 @@ export const useVpnStore = defineStore('vpn', {
     async init() {
       console.log('[FRONTEND] Initializing VPN store')
       this.addLog('info', 'Initializing VPN store', 'frontend')
-      
+
+      // Загружаем конфиги из файловой системы
+      try {
+        const configFile = await invoke('load_configs') as ConfigFile
+        this.configs = configFile.configs
+        this.settings = configFile.settings
+        this.addLog('info', `Loaded ${configFile.configs.length} configs from file system`, 'frontend')
+        
+        // Получаем путь к конфигу
+        this.configPath = await invoke('get_config_path') as string
+        this.addLog('info', `Config path: ${this.configPath}`, 'frontend')
+      } catch (e) {
+        this.addLog('error', `Failed to load configs: ${e}`, 'frontend')
+      }
+
       // Listen for backend status events
       listen('status', (e: any) => {
         const payload = e.payload as { status: Status }
@@ -95,7 +123,7 @@ export const useVpnStore = defineStore('vpn', {
         const payload = e.payload as { status: Status; ip?: string; country?: string }
         console.log('[FRONTEND] Received connection_update event:', payload)
         console.log('[FRONTEND] Current state before update:', { status: this.status, ip: this.ip, country: this.country })
-        
+
         this.status = payload.status
         if (payload.ip) {
           this.ip = payload.ip
@@ -103,7 +131,7 @@ export const useVpnStore = defineStore('vpn', {
         if (payload.country) {
           this.country = payload.country
         }
-        
+
         console.log('[FRONTEND] State after update:', { status: this.status, ip: this.ip, country: this.country })
         this.addLog('info', `Connection updated: ${payload.status} ${payload.ip ? `(${payload.ip})` : ''}`, 'backend')
       })
@@ -122,9 +150,14 @@ export const useVpnStore = defineStore('vpn', {
       this.addLog('info', 'Config text updated', 'frontend')
     },
     
-    updateSettings(p: Partial<{ useSystemProxy: boolean; autorun: boolean; splitHttpOnly: boolean }>) {
+    updateSettings(p: Partial<{ use_system_proxy: boolean; autorun: boolean; split_http_only: boolean; tun_mode: boolean }>) {
       this.settings = { ...this.settings, ...p }
       this.addLog('info', 'Settings updated', 'frontend')
+      
+      // Сохраняем настройки в файловую систему
+      invoke('update_settings', { settings: this.settings }).catch(e => {
+        this.addLog('error', `Failed to save settings: ${e}`, 'frontend')
+      })
     },
     
     async applyConfig() {
@@ -152,6 +185,14 @@ export const useVpnStore = defineStore('vpn', {
         if (!exists) {
           this.configs.push(parsedConfig)
           this.addLog('info', `Config added: ${parsedConfig.name}`, 'frontend')
+          
+          // Сохраняем конфиг в файловую систему
+          try {
+            await invoke('save_config', { config: parsedConfig })
+            this.addLog('info', 'Config saved to file system', 'frontend')
+          } catch (e) {
+            this.addLog('error', `Failed to save config: ${e}`, 'frontend')
+          }
         } else {
           this.addLog('info', `Config validated: ${parsedConfig.name}`, 'frontend')
         }
@@ -273,10 +314,15 @@ export const useVpnStore = defineStore('vpn', {
     },
     
     removeConfig(config: ParsedConfig) {
-      this.configs = this.configs.filter(c => 
+      this.configs = this.configs.filter(c =>
         !(c.server === config.server && c.port === config.port && c.proxy_type === config.proxy_type)
       )
       this.addLog('info', `Removed config: ${config.name}`, 'frontend')
+      
+      // Удаляем конфиг из файловой системы
+      invoke('remove_config', { config }).catch(e => {
+        this.addLog('error', `Failed to remove config: ${e}`, 'frontend')
+      })
     },
     
     clearLogs() {

@@ -6,6 +6,35 @@ const store = useVpnStore()
 
 const configs = computed(() => store.configs)
 
+// Проверяем, какой конфиг сейчас активен
+function isActiveConfig(config: any) {
+  return store.parsedConfig && 
+         store.parsedConfig.server === config.server && 
+         store.parsedConfig.port === config.port && 
+         store.parsedConfig.proxy_type === config.proxy_type
+}
+
+// Проверяем, подключены ли мы к этому конфигу
+function isConnectedToConfig(config: any) {
+  return isActiveConfig(config) && store.status === 'connected'
+}
+
+// Проверяем, подключаемся ли мы к этому конфигу
+function isConnectingToConfig(config: any) {
+  return isActiveConfig(config) && store.status === 'connecting'
+}
+
+async function connectToConfig(config: any) {
+  // Устанавливаем конфиг и сразу подключаемся
+  store.parsedConfig = config
+  store.rawConfig = store.configToString(config)
+  await store.connect()
+}
+
+async function disconnectFromConfig() {
+  await store.disconnect()
+}
+
 function getProxyIcon(proxyType: string) {
   switch (proxyType) {
     case 'Shadowsocks':
@@ -45,6 +74,11 @@ function getProxyColor(proxyType: string) {
           v-for="config in configs" 
           :key="`${config.server}-${config.port}-${config.proxy_type}`"
           class="p-3 hover:bg-gray-50 dark:hover:bg-neutral-700/50 transition-colors"
+          :class="{
+            'bg-green-50 dark:bg-green-900/20 border-l-4 border-green-500': isConnectedToConfig(config),
+            'bg-yellow-50 dark:bg-yellow-900/20 border-l-4 border-yellow-500': isConnectingToConfig(config),
+            'bg-blue-50 dark:bg-blue-900/20 border-l-4 border-blue-500': isActiveConfig(config) && !isConnectedToConfig(config) && !isConnectingToConfig(config)
+          }"
         >
           <div class="flex items-center justify-between">
             <div class="flex items-center gap-3 flex-1 min-w-0">
@@ -81,17 +115,45 @@ function getProxyColor(proxyType: string) {
             </div>
             
             <div class="flex items-center gap-1 ml-2">
+              <!-- Кнопка подключения/отключения -->
               <button 
-                @click="store.selectConfig(config)"
-                class="p-1.5 rounded-md hover:bg-gray-100 dark:hover:bg-neutral-600 transition-colors"
-                title="Select config"
+                v-if="isConnectedToConfig(config)"
+                @click="disconnectFromConfig()"
+                :disabled="store.isBusy"
+                class="px-3 py-1.5 rounded-md bg-red-600 hover:bg-red-700 active:bg-red-800 text-white disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 flex items-center gap-1.5 text-sm"
+                title="Disconnect"
               >
-                <svg class="w-4 h-4 text-gray-600 dark:text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path>
+                <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
                 </svg>
+                Disconnect
               </button>
               
+              <button 
+                v-else-if="isConnectingToConfig(config)"
+                disabled
+                class="px-3 py-1.5 rounded-md bg-yellow-600 text-white cursor-not-allowed transition-all duration-200 flex items-center gap-1.5 text-sm"
+                title="Connecting..."
+              >
+                <div class="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                Connecting...
+              </button>
+              
+              <button 
+                v-else
+                @click="connectToConfig(config)"
+                :disabled="store.isBusy"
+                class="px-3 py-1.5 rounded-md bg-green-600 hover:bg-green-700 active:bg-green-800 text-white disabled:opacity-50 disabled:cursor-not-allowed transition-all duration-200 flex items-center gap-1.5 text-sm"
+                title="Connect"
+              >
+                <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path>
+                </svg>
+                Connect
+              </button>
+              
+              
+              <!-- Кнопка удаления конфига -->
               <button 
                 @click="store.removeConfig(config)"
                 class="p-1.5 rounded-md hover:bg-red-100 dark:hover:bg-red-900/30 transition-colors"
