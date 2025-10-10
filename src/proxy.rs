@@ -42,14 +42,14 @@ impl ShadowsocksClient {
         password: String,
         method: String,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        log::info!("Starting Shadowsocks client using external process");
+        log::info!("Starting Shadowsocks client using shadowsocks-rust library");
         log::info!("Local proxy: 127.0.0.1:1080");
         log::info!("Remote server: {}:{}", server, port);
         log::info!("Encryption method: {}", method);
         log::info!("Password: [HIDDEN]");
 
-        // Skip system shadowsocks client for now, use our custom implementation
-        log::info!("Using custom Shadowsocks implementation");
+        // Используем shadowsocks-rust библиотеку для правильной реализации протокола
+        use crate::shadowsocks::{ShadowsocksClient as SsClient, ShadowsocksConfig};
         
         let config = ShadowsocksConfig {
             server,
