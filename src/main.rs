@@ -52,6 +52,26 @@ fn main() {
     });
 
     tauri::Builder::default()
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                // Останавливаем закрытие до завершения очистки (одноразово)
+                static mut SHUTTING_DOWN: bool = false;
+                let do_cleanup = unsafe { if SHUTTING_DOWN { false } else { SHUTTING_DOWN = true; true } };
+                if do_cleanup {
+                    api.prevent_close();
+                    use tauri::Manager;
+                    let app = window.app_handle().clone();
+                    // Асинхронно останавливаем TUN/прокси и завершаем процесс
+                    tauri::async_runtime::spawn(async move {
+                        let _ = disable_tun_mode().await;
+                        let _ = clear_system_proxy().await;
+                        // disconnect_vpn требует window, но закрывать окно нам не нужно — завершаем app
+                        // Если нужно, можно вызвать disconnect_vpn через скрытое окно
+                        let _ = app.exit(0);
+                    });
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             parse_proxy_config,
             connect_vpn,

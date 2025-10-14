@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::process::Command;
+use std::process::Stdio;
 
 #[derive(Debug, Clone)]
 pub struct ProxySettings {
@@ -138,64 +139,21 @@ impl SystemProxyManager {
     }
 
     async fn set_linux_system_proxy(&self, settings: &ProxySettings) -> Result<()> {
-        // Используем gsettings для установки системного прокси в GNOME/KDE
-        if let Some(ref http_proxy) = settings.http_proxy {
-            // Парсим URL прокси
-            if let Some(proxy_url) = http_proxy.strip_prefix("socks5://") {
-                if let Some((host, port)) = proxy_url.split_once(':') {
-                    // Устанавливаем SOCKS5 прокси
-                    
-                    // Включаем прокси
-                    Command::new("gsettings")
-                        .args(&["set", "org.gnome.system.proxy", "mode", "manual"])
-                        .output()?;
-
-                    // Устанавливаем SOCKS прокси
-                    Command::new("gsettings")
-                        .args(&["set", "org.gnome.system.proxy.socks", "host", host])
-                        .output()?;
-
-                    Command::new("gsettings")
-                        .args(&["set", "org.gnome.system.proxy.socks", "port", port])
-                        .output()?;
-
-                    // Устанавливаем HTTP прокси (тот же SOCKS5)
-                    Command::new("gsettings")
-                        .args(&["set", "org.gnome.system.proxy.http", "host", host])
-                        .output()?;
-
-                    Command::new("gsettings")
-                        .args(&["set", "org.gnome.system.proxy.http", "port", port])
-                        .output()?;
-
-                    // Устанавливаем HTTPS прокси (тот же SOCKS5)
-                    Command::new("gsettings")
-                        .args(&["set", "org.gnome.system.proxy.https", "host", host])
-                        .output()?;
-
-                    Command::new("gsettings")
-                        .args(&["set", "org.gnome.system.proxy.https", "port", port])
-                        .output()?;
-
-                    // Устанавливаем исключения (no_proxy)
-                    if let Some(ref no_proxy) = settings.no_proxy {
-                        Command::new("gsettings")
-                            .args(&["set", "org.gnome.system.proxy", "ignore-hosts", no_proxy])
-                            .output()?;
-                    }
-
-                    log::info!("[SYSTEM_PROXY] Linux system proxy set: {}:{}", host, port);
+        let de = detect_desktop_env();
+        match de {
+            DesktopEnv::Gnome if which("gsettings") => set_proxy_gnome(settings)?,
+            DesktopEnv::Kde if which("kwriteconfig5") => set_proxy_kde(settings)?,
+            _ => {
+                // Пытаемся gsettings → KDE → иначе ничего (env уже выставлены)
+                if which("gsettings") {
+                    set_proxy_gnome(settings)?;
+                } else if which("kwriteconfig5") {
+                    set_proxy_kde(settings)?;
+                } else {
+                    log::warn!("[SYSTEM_PROXY] No known system proxy backend found (gsettings/kwriteconfig5). Using env only.");
                 }
             }
-        } else {
-            // Отключаем прокси
-            Command::new("gsettings")
-                .args(&["set", "org.gnome.system.proxy", "mode", "none"])
-                .output()?;
-
-            log::info!("[SYSTEM_PROXY] Linux system proxy disabled");
         }
-
         Ok(())
     }
 
@@ -241,13 +199,101 @@ impl SystemProxyManager {
             let empty_settings = ProxySettings::new();
             self.set_proxy_settings(&empty_settings).await?;
         }
-
+        // Также выключаем DE-прокси явно
+        if cfg!(target_os = "linux") {
+            let de = detect_desktop_env();
+            match de {
+                DesktopEnv::Gnome if which("gsettings") => {
+                    let _ = Command::new("gsettings").args(["set", "org.gnome.system.proxy", "mode", "none"]).output();
+                }
+                DesktopEnv::Kde if which("kwriteconfig5") => {
+                    // ProxyType=0 (No proxy)
+                    let _ = Command::new("kwriteconfig5").args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "ProxyType", "0"]).output();
+                    // Убираем значения
+                    let _ = Command::new("kwriteconfig5").args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "socksProxy", ""]).output();
+                    // Применяем
+                    let _ = Command::new("qdbus").args(["org.kde.kded5", "/kded", "reconfigure"]).stdout(Stdio::null()).stderr(Stdio::null()).output();
+                }
+                _ => {}
+            }
+        }
         Ok(())
     }
 
     pub fn is_tun_mode(&self) -> bool {
         self.tun_mode
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DesktopEnv { Gnome, Kde, Unknown }
+
+fn detect_desktop_env() -> DesktopEnv {
+    let de = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase();
+    if de.contains("gnome") { return DesktopEnv::Gnome; }
+    if de.contains("kde") || de.contains("plasma") { return DesktopEnv::Kde; }
+    let ses = std::env::var("DESKTOP_SESSION").unwrap_or_default().to_lowercase();
+    if ses.contains("gnome") { return DesktopEnv::Gnome; }
+    if ses.contains("kde") || ses.contains("plasma") { return DesktopEnv::Kde; }
+    DesktopEnv::Unknown
+}
+
+fn which(bin: &str) -> bool {
+    Command::new("which").arg(bin).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
+}
+
+fn set_proxy_gnome(settings: &ProxySettings) -> Result<()> {
+    if let Some(ref http_proxy) = settings.http_proxy {
+        if let Some(proxy_url) = http_proxy.strip_prefix("socks5://") {
+            if let Some((host, port)) = proxy_url.split_once(':') {
+                // mode manual
+                Command::new("gsettings").args(["set", "org.gnome.system.proxy", "mode", "manual"]).output()?;
+                // socks host/port
+                Command::new("gsettings").args(["set", "org.gnome.system.proxy.socks", "host", host]).output()?;
+                Command::new("gsettings").args(["set", "org.gnome.system.proxy.socks", "port", port]).output()?;
+                // ignore-hosts expects array string: ['localhost','127.0.0.1','::1']
+                let ignore = settings.no_proxy.clone().unwrap_or_else(|| "localhost,127.0.0.1,::1".to_string());
+                let arr = format!("[{}]",
+                    ignore.split(',')
+                        .map(|s| format!("'{}'", s.trim()))
+                        .collect::<Vec<_>>()
+                        .join(","));
+                let _ = Command::new("gsettings").args(["set", "org.gnome.system.proxy", "ignore-hosts", &arr]).output();
+                log::info!("[SYSTEM_PROXY] GNOME proxy set: {}:{}", host, port);
+            }
+        }
+    } else {
+        // disable
+        Command::new("gsettings").args(["set", "org.gnome.system.proxy", "mode", "none"]).output()?;
+        log::info!("[SYSTEM_PROXY] GNOME proxy disabled");
+    }
+    Ok(())
+}
+
+fn set_proxy_kde(settings: &ProxySettings) -> Result<()> {
+    // KDE stores in kioslaverc; ProxyType: 0=no, 1=auto, 2=manual
+    if let Some(ref http_proxy) = settings.http_proxy {
+        if let Some(proxy_url) = http_proxy.strip_prefix("socks5://") {
+            if let Some((host, port)) = proxy_url.split_once(':') {
+                Command::new("kwriteconfig5").args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "ProxyType", "2"]).output()?;
+                let socks_value = format!("socks://{}:{}", host, port);
+                Command::new("kwriteconfig5").args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "socksProxy", &socks_value]).output()?;
+                // http/https empty to avoid forcing
+                Command::new("kwriteconfig5").args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "httpProxy", ""]).output()?;
+                Command::new("kwriteconfig5").args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "httpsProxy", ""]).output()?;
+                // apply
+                let _ = Command::new("qdbus").args(["org.kde.kded5", "/kded", "reconfigure"]).stdout(Stdio::null()).stderr(Stdio::null()).output();
+                log::info!("[SYSTEM_PROXY] KDE proxy set: {}:{}", host, port);
+            }
+        }
+    } else {
+        // disable
+        Command::new("kwriteconfig5").args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "ProxyType", "0"]).output()?;
+        Command::new("kwriteconfig5").args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "socksProxy", ""]).output()?;
+        let _ = Command::new("qdbus").args(["org.kde.kded5", "/kded", "reconfigure"]).stdout(Stdio::null()).stderr(Stdio::null()).output();
+        log::info!("[SYSTEM_PROXY] KDE proxy disabled");
+    }
+    Ok(())
 }
 
 impl Default for SystemProxyManager {
