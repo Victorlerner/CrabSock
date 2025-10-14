@@ -1,10 +1,36 @@
 use crab_sock::commands::*;
 use crab_sock::utils::init_logging;
 use crab_sock::config_manager::ConfigManager;
+#[cfg(target_os = "linux")]
+use crab_sock::linux_capabilities::{has_cap_net_admin, set_cap_net_admin_via_pkexec, set_cap_net_admin_via_sudo};
 
 fn main() {
     init_logging();
     log::info!("[MAIN] Starting CrabSock Tauri app");
+
+    #[cfg(target_os = "linux")]
+    {
+        let is_debug = cfg!(debug_assertions);
+        let skip = std::env::var("CRABSOCK_SKIP_CAP_CHECK").is_ok();
+        if !is_debug && !skip {
+            if !has_cap_net_admin() {
+                log::info!("[MAIN] cap_net_admin is missing, attempting to set via pkexec/sudo");
+                match set_cap_net_admin_via_pkexec().or_else(|_| set_cap_net_admin_via_sudo()) {
+                    Ok(_) => {
+                        log::info!("[MAIN] cap_net_admin successfully set on startup, restarting to apply capabilities");
+                        if let Ok(exe) = std::env::current_exe() {
+                            let args: Vec<String> = std::env::args().skip(1).collect();
+                            let _ = std::process::Command::new(exe).args(args).spawn();
+                        }
+                        std::process::exit(0);
+                    }
+                    Err(e) => log::warn!("[MAIN] Failed to set cap_net_admin on startup: {}", e),
+                }
+            }
+        } else {
+            log::info!("[MAIN] Skipping capability setup (debug build or CRABSOCK_SKIP_CAP_CHECK set)");
+        }
+    }
 
     // Инициализируем конфиги при старте приложения
     tokio::runtime::Runtime::new().unwrap().block_on(async {

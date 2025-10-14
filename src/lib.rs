@@ -7,6 +7,7 @@ pub mod shadowsocks;
 pub mod config_manager;
 pub mod system_proxy;
 pub mod tun_manager;
+pub mod linux_capabilities;
 pub mod simple_proxy;
 pub mod optimized_shadowsocks;
 pub mod shadowsocks_socks5;

@@ -1,6 +1,10 @@
 use anyhow::Result;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, IpAddr};
 use tun_tap::{Iface, Mode};
+use rtnetlink::new_connection;
+use futures_util::TryStreamExt;
+use ipnetwork::Ipv4Network;
+use crate::linux_capabilities::has_cap_net_admin;
 
 #[derive(Debug, Clone)]
 pub struct TunConfig {
@@ -51,7 +55,7 @@ impl TunManager {
             return Err(anyhow::anyhow!("Insufficient permissions to create TUN interface"));
         }
 
-        // Пытаемся удалить существующий интерфейс
+        // Пытаемся удалить существующий интерфейс (без sudo)
         self.cleanup_existing_interface().await?;
 
         // Создаем TUN интерфейс
@@ -99,25 +103,30 @@ impl TunManager {
 
     async fn cleanup_existing_interface(&self) -> Result<()> {
         let interface_name = &self.config.name;
-        
-        // Пытаемся удалить существующий интерфейс
-        let output = std::process::Command::new("sudo")
-            .args(&["ip", "tuntap", "del", "mode", "tun", "dev", interface_name])
-            .output()?;
-
-        if output.status.success() {
-            log::info!("[TUN] Removed existing interface: {}", interface_name);
-        } else {
-            log::debug!("[TUN] No existing interface to remove: {}", interface_name);
+        // Используем rtnetlink для удаления (если есть)
+        if !has_cap_net_admin() {
+            log::debug!("[TUN] No cap_net_admin, skip cleanup");
+            return Ok(());
         }
-
+        let (connection, handle, _) = new_connection()?;
+        tokio::spawn(connection);
+        let mut links = handle.link().get().match_name(interface_name.to_string()).execute();
+        loop {
+            match links.try_next().await {
+                Ok(Some(msg)) => {
+                    let index = msg.header.index;
+                    let _ = handle.link().del(index).execute().await;
+                    log::info!("[TUN] Removed existing interface: {}", interface_name);
+                }
+                _ => break,
+            }
+        }
         Ok(())
     }
 
     fn check_permissions(&self) -> bool {
-        // Проверяем, есть ли у процесса права для создания TUN интерфейса
-        // В Linux это требует CAP_NET_ADMIN
-        std::fs::metadata("/dev/net/tun").is_ok()
+        // Требуется CAP_NET_ADMIN
+        has_cap_net_admin()
     }
 
     async fn configure_tun_interface(&self) -> Result<()> {
@@ -127,25 +136,28 @@ impl TunManager {
         log::info!("[TUN] Configuring interface {} with IP {}/{}", 
                    interface_name, address, self.get_cidr_prefix());
 
-        // Настраиваем IP адрес через ip команду с sudo
-        let output = std::process::Command::new("sudo")
-            .args(&["ip", "addr", "add", &format!("{}/{}", address, self.get_cidr_prefix()), 
-                   "dev", interface_name])
-            .output()?;
-
-        if !output.status.success() {
-            log::warn!("[TUN] Failed to set IP address: {}", String::from_utf8_lossy(&output.stderr));
+        if !has_cap_net_admin() {
+            return Err(anyhow::anyhow!("Insufficient permissions to configure TUN (cap_net_admin missing)"));
         }
 
-        // Поднимаем интерфейс с sudo
-        let output = std::process::Command::new("sudo")
-            .args(&["ip", "link", "set", "dev", interface_name, "up"])
-            .output()?;
+        let (connection, handle, _) = new_connection()?;
+        tokio::spawn(connection);
 
-        if !output.status.success() {
-            return Err(anyhow::anyhow!("Failed to bring up interface: {}", 
-                String::from_utf8_lossy(&output.stderr)));
+        // bring link up
+        let mut links = handle.link().get().match_name(interface_name.to_string()).execute();
+        let mut maybe_index: Option<u32> = None;
+        loop {
+            match links.try_next().await {
+                Ok(Some(msg)) => { maybe_index = Some(msg.header.index); break; }
+                _ => break,
+            }
         }
+        let index = maybe_index.ok_or_else(|| anyhow::anyhow!("Interface not found after creation"))?;
+        handle.link().set(index).up().execute().await?;
+
+        // add address
+        let cidr = Ipv4Network::new(address, self.get_cidr_prefix()).map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        handle.address().add(index, IpAddr::V4(cidr.ip()), cidr.prefix()).execute().await?;
 
         Ok(())
     }
@@ -154,17 +166,22 @@ impl TunManager {
         let interface_name = &self.config.name;
         
         log::info!("[TUN] Clearing routes");
-
-        // Удаляем IP адрес с sudo
-        let output = std::process::Command::new("sudo")
-            .args(&["ip", "addr", "del", &format!("{}/{}", self.config.address, self.get_cidr_prefix()), 
-                   "dev", interface_name])
-            .output()?;
-
-        if !output.status.success() {
-            log::debug!("[TUN] IP address not found or already removed");
+        if !has_cap_net_admin() {
+            log::debug!("[TUN] No cap_net_admin, skip clear routes");
+            return Ok(());
         }
-
+        let (connection, handle, _) = new_connection()?;
+        tokio::spawn(connection);
+        let mut links = handle.link().get().match_name(interface_name.to_string()).execute();
+        loop {
+            match links.try_next().await {
+                Ok(Some(msg)) => {
+                    let index = msg.header.index;
+                    let _ = handle.link().del(index).execute().await;
+                }
+                _ => break,
+            }
+        }
         Ok(())
     }
 

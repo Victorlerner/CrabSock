@@ -3,6 +3,7 @@ use crate::proxy::{ProxyManager, ConnectionStatus};
 use crate::config_manager::{ConfigManager, ConfigFile, AppSettings};
 use crate::system_proxy::{SystemProxyManager, ProxySettings};
 use crate::tun_manager::TunManager;
+use crate::linux_capabilities::{has_cap_net_admin, set_cap_net_admin_via_pkexec, set_cap_net_admin_via_sudo};
 use once_cell::sync::Lazy;
 use tokio::sync::Mutex;
 use serde::Serialize;
@@ -388,7 +389,7 @@ pub async fn enable_tun_mode() -> Result<(), String> {
             println!("[STDOUT] VPN is connected, starting TUN interface");
             
             // Сначала проверяем capability
-            let has_capability = check_tun_capability().await;
+            let has_capability = has_cap_net_admin();
             println!("[STDOUT] TUN capability check: {}", has_capability);
             
             // Запускаем TUN интерфейс
@@ -481,34 +482,9 @@ pub async fn request_tun_permissions() -> Result<TunPermissionResult, String> {
     log::info!("[TUN] Requesting TUN permissions");
     println!("[STDOUT] TUN: Requesting TUN permissions");
     
-    // Проверяем, есть ли pkexec
-    let pkexec_check = std::process::Command::new("which")
-        .arg("pkexec")
-        .output();
-    
-    if pkexec_check.is_err() || !pkexec_check.unwrap().status.success() {
-        println!("[STDOUT] TUN: pkexec not found");
-        return Ok(TunPermissionResult {
-            success: false,
-            message: "pkexec not found. Please install pkexec first.".to_string(),
-            needs_restart: false,
-        });
-    }
-    
-    // Получаем путь к исполняемому файлу
-    let current_exe = std::env::current_exe()
-        .map_err(|e| format!("Failed to get current executable path: {}", e))?;
-    
-    println!("[STDOUT] TUN: Setting capability cap_net_admin=ep for: {}", current_exe.display());
-    
-    // Устанавливаем capability через pkexec
-    let output = std::process::Command::new("pkexec")
-        .args(&["setcap", "cap_net_admin=ep", &current_exe.to_string_lossy()])
-        .output();
-    
-    match output {
-        Ok(output) => {
-            if output.status.success() {
+    println!("[STDOUT] TUN: Setting capability via pkexec");
+    match set_cap_net_admin_via_pkexec() {
+        Ok(_) => {
                 println!("[STDOUT] TUN: Capability set successfully");
                 log::info!("[TUN] Capability set successfully");
                 
@@ -517,34 +493,12 @@ pub async fn request_tun_permissions() -> Result<TunPermissionResult, String> {
                     message: "Permissions granted successfully. Please build release version for TUN Mode.".to_string(),
                     needs_restart: true,
                 })
-            } else {
-                let error = String::from_utf8_lossy(&output.stderr);
-                println!("[STDOUT] TUN: Failed to set capability: {}", error);
-                
-                // Проверяем, отменил ли пользователь диалог
-                if error.contains("cancelled") || error.contains("canceled") || error.contains("Request dismissed") || output.status.code() == Some(1) {
-                    Ok(TunPermissionResult {
-                        success: false,
-                        message: "Permission request was cancelled by user. You may be temporarily locked out due to failed authentication attempts.".to_string(),
-                        needs_restart: false,
-                    })
-                } else {
-                    Ok(TunPermissionResult {
-                        success: false,
-                        message: format!("Failed to set capability: {}", error),
-                        needs_restart: false,
-                    })
-                }
-            }
         }
-        Err(e) => {
-            println!("[STDOUT] TUN: Failed to run pkexec: {}", e);
-            Ok(TunPermissionResult {
-                success: false,
-                message: format!("Failed to run pkexec: {}", e),
-                needs_restart: false,
-            })
-        }
+        Err(error) => Ok(TunPermissionResult {
+            success: false,
+            message: error,
+            needs_restart: false,
+        })
     }
 }
 
@@ -563,20 +517,9 @@ pub async fn request_tun_permissions_sudo() -> Result<TunPermissionResult, Strin
     log::info!("[TUN] Requesting TUN permissions via sudo");
     println!("[STDOUT] TUN: Requesting TUN permissions via sudo");
     
-    // Получаем путь к исполняемому файлу
-    let current_exe = std::env::current_exe()
-        .map_err(|e| format!("Failed to get current executable path: {}", e))?;
-    
-    println!("[STDOUT] TUN: Setting capability cap_net_admin=ep via sudo for: {}", current_exe.display());
-    
-    // Устанавливаем capability через sudo
-    let output = std::process::Command::new("sudo")
-        .args(&["setcap", "cap_net_admin=ep", &current_exe.to_string_lossy()])
-        .output();
-    
-    match output {
-        Ok(output) => {
-            if output.status.success() {
+    println!("[STDOUT] TUN: Setting capability cap_net_admin=ep via sudo");
+    match set_cap_net_admin_via_sudo() {
+        Ok(_) => {
                 println!("[STDOUT] TUN: Capability set successfully via sudo");
                 log::info!("[TUN] Capability set successfully via sudo");
                 
@@ -585,60 +528,18 @@ pub async fn request_tun_permissions_sudo() -> Result<TunPermissionResult, Strin
                     message: "Permissions granted successfully via sudo. Please build release version for TUN Mode.".to_string(),
                     needs_restart: true,
                 })
-            } else {
-                let error = String::from_utf8_lossy(&output.stderr);
-                println!("[STDOUT] TUN: Failed to set capability via sudo: {}", error);
-                
-                Ok(TunPermissionResult {
-                    success: false,
-                    message: format!("Failed to set capability via sudo: {}", error),
-                    needs_restart: false,
-                })
-            }
         }
-        Err(e) => {
-            println!("[STDOUT] TUN: Failed to run sudo: {}", e);
-            Ok(TunPermissionResult {
-                success: false,
-                message: format!("Failed to run sudo: {}", e),
-                needs_restart: false,
-            })
-        }
+        Err(error) => Ok(TunPermissionResult {
+            success: false,
+            message: error,
+            needs_restart: false,
+        })
     }
 }
 
 #[tauri::command]
 pub async fn check_tun_capability_command() -> Result<bool, String> {
-    Ok(check_tun_capability().await)
-}
-
-async fn check_tun_capability() -> bool {
-    let current_exe = match std::env::current_exe() {
-        Ok(path) => path,
-        Err(_) => return false,
-    };
-    
-    // Проверяем capability через getcap
-    let output = std::process::Command::new("getcap")
-        .arg(&current_exe)
-        .output();
-    
-    match output {
-        Ok(output) => {
-            if output.status.success() {
-                let output_str = String::from_utf8_lossy(&output.stdout);
-                println!("[STDOUT] TUN: Current capabilities: {}", output_str);
-                output_str.contains("cap_net_admin")
-            } else {
-                println!("[STDOUT] TUN: getcap failed: {}", String::from_utf8_lossy(&output.stderr));
-                false
-            }
-        }
-        Err(e) => {
-            println!("[STDOUT] TUN: Failed to run getcap: {}", e);
-            false
-        }
-    }
+    Ok(has_cap_net_admin())
 }
 
 #[tauri::command]
