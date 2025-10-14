@@ -53,7 +53,7 @@ export const useVpnStore = defineStore('vpn', {
     showConfig: true,
     logs: [] as LogEntry[],
     error: null as string | null,
-    showLogs: false,
+    showLogs: true,
     settings: {
       use_system_proxy: false,
       autorun: false,

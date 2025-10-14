@@ -13,8 +13,8 @@
       {
         "additionalBrowserArgs": "--no-sandbox",
         "title": "CrabSock",
-        "width": 900,
-        "height": 700,
+        "width": 1100,
+        "height": 900,
         "resizable": true
       }
     ],

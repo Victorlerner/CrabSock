@@ -2,9 +2,7 @@
 import ConfigInput from '@src/components/ConfigInput.vue'
 import ConnectButton from '@src/components/ConnectButton.vue'
 import IpFlag from '@src/components/IpFlag.vue'
-import SettingsPanel from '@src/components/Settings.vue'
 import LoadingSpinner from '@src/components/LoadingSpinner.vue'
-import ConnectedView from '@src/components/ConnectedView.vue'
 import ConfigList from '@src/components/ConfigList.vue'
 import LogsPanel from '@src/components/LogsPanel.vue'
 import ConnectionStatus from '@src/components/ConnectionStatus.vue'
@@ -40,10 +38,10 @@ onMounted(() => store.init())
             <ConfigInput />
           </section>
 
+
           <!-- Connect Button -->
-          <section class="flex items-center gap-3">
+          <section  v-if="!store.showConfig" class="flex items-center gap-3">
             <ConnectButton />
-            <SettingsPanel />
           </section>
         </div>
 
