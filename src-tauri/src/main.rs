@@ -82,18 +82,12 @@ fn main() {
             load_configs,
             save_config,
             remove_config,
-            update_settings,
             get_config_path,
             set_system_proxy,
             clear_system_proxy,
             enable_tun_mode,
             disable_tun_mode,
-            is_tun_mode_enabled,
-                request_tun_permissions,
-                request_tun_permissions_sudo,
-                check_tun_capability_command,
-                build_release_version,
-                restart_application
+            is_tun_mode_enabled
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri app");

@@ -11,21 +11,11 @@ pub struct ConfigFile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AppSettings {
-    pub use_system_proxy: bool,
-    pub autorun: bool,
-    pub split_http_only: bool,
-    pub tun_mode: bool,
-}
+pub struct AppSettings {}
 
 impl Default for AppSettings {
     fn default() -> Self {
-        Self {
-            use_system_proxy: false,
-            autorun: false,
-            split_http_only: false,
-            tun_mode: false,
-        }
+        Self {}
     }
 }
 
@@ -123,11 +113,11 @@ impl ConfigManager {
     }
     
     pub async fn update_settings(&self, settings: AppSettings) -> Result<()> {
+        // settings removed; keep compatibility no-op
         let mut config_file = self.load_configs().await?;
         config_file.settings = settings;
         self.save_configs(&config_file).await?;
-        
-        log::info!("[CONFIG] Updated settings");
+        log::info!("[CONFIG] Settings no-op update");
         Ok(())
     }
     

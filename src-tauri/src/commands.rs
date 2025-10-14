@@ -1,9 +1,9 @@
 use crate::config::ProxyConfig;
 use crate::proxy::{ProxyManager, ConnectionStatus};
-use crate::config_manager::{ConfigManager, ConfigFile, AppSettings};
+use crate::config_manager::{ConfigManager, ConfigFile};
 use crate::system_proxy::{SystemProxyManager, ProxySettings};
 use crate::tun_manager::TunManager;
-use crate::linux_capabilities::{has_cap_net_admin, set_cap_net_admin_via_pkexec, set_cap_net_admin_via_sudo};
+use crate::linux_capabilities::has_cap_net_admin;
 use once_cell::sync::Lazy;
 use tokio::sync::Mutex;
 use serde::Serialize;
@@ -89,6 +89,11 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                         Err(e) => println!("[STDOUT] Failed to send ip_verified event: {:?}", e),
                     }
                     
+                    // Автоматически включаем TUN после успешного подключения
+                    if let Err(e) = enable_tun_mode().await {
+                        log::warn!("[CONNECT] Failed to enable TUN mode automatically: {}", e);
+                    }
+
                     log::info!("[CONNECT] VPN connected and verified successfully");
                     Ok(())
                 }
@@ -100,6 +105,11 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                         status: "connected".into(),
                     });
                     
+                    // Даже при неудачной проверке IP попробуем включить TUN
+                    if let Err(e2) = enable_tun_mode().await {
+                        log::warn!("[CONNECT] Failed to enable TUN mode automatically after IP check fail: {}", e2);
+                    }
+
                     log::info!("[CONNECT] VPN connected (IP verification failed)");
                     Ok(())
                 }
@@ -119,6 +129,11 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
 pub async fn disconnect_vpn(window: tauri::Window) -> Result<(), String> {
     log::info!("[DISCONNECT] Disconnecting VPN");
 
+    // Сначала отключаем TUN и системный прокси. Делаем это в отдельной задаче, чтобы жесткий трафик мог завершиться корректно
+    let tun_task = tauri::async_runtime::spawn(async move {
+        let _ = disable_tun_mode().await;
+    });
+
     let result = {
         let manager = PROXY_MANAGER.lock().await;
         manager.disconnect().await
@@ -130,6 +145,7 @@ pub async fn disconnect_vpn(window: tauri::Window) -> Result<(), String> {
                 status: "disconnected".into(),
             });
 
+            let _ = tun_task.await; // дожидаемся выключения TUN
             log::info!("[DISCONNECT] VPN disconnected");
             Ok(())
         }
@@ -294,19 +310,7 @@ pub async fn remove_config(config: ProxyConfig) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-pub async fn update_settings(settings: AppSettings) -> Result<(), String> {
-    log::info!("[CONFIG] Updating settings");
-    
-    let config_manager = ConfigManager::new()
-        .map_err(|e| format!("Failed to create config manager: {}", e))?;
-    
-    config_manager.update_settings(settings).await
-        .map_err(|e| format!("Failed to update settings: {}", e))?;
-    
-    log::info!("[CONFIG] Settings updated successfully");
-    Ok(())
-}
+// removed update_settings: settings UI eliminated
 
 #[tauri::command]
 pub async fn get_config_path() -> Result<String, String> {
@@ -470,132 +474,3 @@ pub async fn is_tun_mode_enabled() -> Result<bool, String> {
     Ok(system_manager.is_tun_mode())
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct TunPermissionResult {
-    pub success: bool,
-    pub message: String,
-    pub needs_restart: bool,
-}
-
-#[tauri::command]
-pub async fn request_tun_permissions() -> Result<TunPermissionResult, String> {
-    log::info!("[TUN] Requesting TUN permissions");
-    println!("[STDOUT] TUN: Requesting TUN permissions");
-    
-    println!("[STDOUT] TUN: Setting capability via pkexec");
-    match set_cap_net_admin_via_pkexec() {
-        Ok(_) => {
-                println!("[STDOUT] TUN: Capability set successfully");
-                log::info!("[TUN] Capability set successfully");
-                
-                Ok(TunPermissionResult {
-                    success: true,
-                    message: "Permissions granted successfully. Please build release version for TUN Mode.".to_string(),
-                    needs_restart: true,
-                })
-        }
-        Err(error) => Ok(TunPermissionResult {
-            success: false,
-            message: error,
-            needs_restart: false,
-        })
-    }
-}
-
-#[tauri::command]
-pub async fn restart_application() -> Result<(), String> {
-    log::info!("[TUN] Restart application requested - but we don't restart in development mode");
-    println!("[STDOUT] TUN: Restart application requested - but we don't restart in development mode");
-    
-    // В development mode не перезапускаем приложение
-    // Вместо этого просто возвращаем успех
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn request_tun_permissions_sudo() -> Result<TunPermissionResult, String> {
-    log::info!("[TUN] Requesting TUN permissions via sudo");
-    println!("[STDOUT] TUN: Requesting TUN permissions via sudo");
-    
-    println!("[STDOUT] TUN: Setting capability cap_net_admin=ep via sudo");
-    match set_cap_net_admin_via_sudo() {
-        Ok(_) => {
-                println!("[STDOUT] TUN: Capability set successfully via sudo");
-                log::info!("[TUN] Capability set successfully via sudo");
-                
-                Ok(TunPermissionResult {
-                    success: true,
-                    message: "Permissions granted successfully via sudo. Please build release version for TUN Mode.".to_string(),
-                    needs_restart: true,
-                })
-        }
-        Err(error) => Ok(TunPermissionResult {
-            success: false,
-            message: error,
-            needs_restart: false,
-        })
-    }
-}
-
-#[tauri::command]
-pub async fn check_tun_capability_command() -> Result<bool, String> {
-    Ok(has_cap_net_admin())
-}
-
-#[tauri::command]
-pub async fn build_release_version() -> Result<String, String> {
-    log::info!("[BUILD] Building release version");
-    println!("[STDOUT] BUILD: Building release version");
-    
-    // Получаем путь к проекту Tauri
-    let project_path = std::env::current_dir()
-        .map_err(|e| format!("Failed to get current directory: {}", e))?
-        .join("src-tauri");
-    
-    println!("[STDOUT] BUILD: Project path: {}", project_path.display());
-    
-    // Запускаем сборку
-    let output = std::process::Command::new("cargo")
-        .args(&["build", "--release"])
-        .current_dir(&project_path)
-        .output();
-    
-    match output {
-        Ok(output) => {
-            if output.status.success() {
-                let release_path = project_path.join("target/release/crab-sock");
-                println!("[STDOUT] BUILD: Release build successful: {}", release_path.display());
-                
-                // Устанавливаем capability для release версии
-                let setcap_output = std::process::Command::new("sudo")
-                    .args(&["setcap", "cap_net_admin=ep", &release_path.to_string_lossy()])
-                    .output();
-                
-                match setcap_output {
-                    Ok(setcap_output) => {
-                        if setcap_output.status.success() {
-                            println!("[STDOUT] BUILD: Capability set for release version");
-                            Ok(format!("Release version built successfully: {}", release_path.display()))
-                        } else {
-                            let error = String::from_utf8_lossy(&setcap_output.stderr);
-                            println!("[STDOUT] BUILD: Failed to set capability: {}", error);
-                            Ok(format!("Release version built but capability setting failed: {}", error))
-                        }
-                    }
-                    Err(e) => {
-                        println!("[STDOUT] BUILD: Failed to run pkexec: {}", e);
-                        Ok(format!("Release version built but capability setting failed: {}", e))
-                    }
-                }
-            } else {
-                let error = String::from_utf8_lossy(&output.stderr);
-                println!("[STDOUT] BUILD: Build failed: {}", error);
-                Err(format!("Build failed: {}", error))
-            }
-        }
-        Err(e) => {
-            println!("[STDOUT] BUILD: Failed to run cargo: {}", e);
-            Err(format!("Failed to run cargo: {}", e))
-        }
-    }
-}
