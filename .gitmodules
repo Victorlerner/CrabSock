@@ -1,0 +1,3 @@
+[submodule "src-tauri"]
+	path = src-tauri
+	url = ./src-tauri
