@@ -2,6 +2,7 @@
 name = "crab-sock"
 version = "0.1.0"
 edition = "2021"
+exclude = ["pkg/*", "pkg/**"]
 
 [lib]
 name = "crab_sock"

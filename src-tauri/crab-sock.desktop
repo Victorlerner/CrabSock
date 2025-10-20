@@ -1,9 +1,0 @@
-[Desktop Entry]
-Name=Crab Sock VPN
-Comment=VPN client with crab icon
-Exec=/usr/bin/crab-sock
-Icon=crab-sock
-Type=Application
-Terminal=false
-StartupWMClass=CrabSock
-Categories=Network;Utility;

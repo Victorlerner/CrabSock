@@ -17,7 +17,11 @@ onMounted(() => store.init())
   <div class="min-h-full bg-gray-50 dark:bg-neutral-900 text-gray-900 dark:text-gray-100">
     <div class="mx-auto max-w-4xl p-6 space-y-6">
       <header class="flex items-center justify-between">
-        <h1 class="text-2xl font-semibold">CrabSock</h1>
+        <img src="/app-icon.png" alt="App icon" class="w-16 h-16" />
+        <div class="flex items-center gap-2">
+         
+          <h1 class="text-2xl font-semibold">CrabSock</h1>
+        </div>
         <IpFlag />
       </header>
 
