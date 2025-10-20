@@ -5,6 +5,9 @@ use crab_sock::utils::init_logging;
 use crab_sock::config_manager::ConfigManager;
 #[cfg(target_os = "linux")]
 use crab_sock::linux_capabilities::{has_cap_net_admin, set_cap_net_admin_via_pkexec, set_cap_net_admin_via_sudo};
+use tauri::Manager;
+use tauri::tray::{TrayIconBuilder, TrayIconEvent};
+use tauri::menu::{Menu, MenuItem};
 
 fn main() {
     // On Windows release builds: if launched from an existing console (cmd/powershell),
@@ -77,24 +80,62 @@ fn main() {
     });
 
     tauri::Builder::default()
+        .setup(|app| {
+            // Создаем трей-иконку и обрабатываем клики для показа окна
+            let icon = app.default_window_icon().cloned().expect("default window icon missing");
+            // Трей-меню
+            let show_item = MenuItem::with_id(app, "show", "Показать", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "Закрыть", true, None::<&str>)?;
+            let menu = Menu::new(app)?;
+            menu.append(&show_item)?;
+            menu.append(&quit_item)?;
+
+            let _tray = TrayIconBuilder::new()
+                .icon(icon)
+                .tooltip("CrabSock")
+                .menu(&menu)
+                .show_menu_on_left_click(true)
+                .on_tray_icon_event(|icon, event| {
+                    match event {
+                        // ЛКМ открывает меню; даблклик показывает окно
+                        TrayIconEvent::DoubleClick { .. } => {
+                            if let Some(win) = icon.app_handle().get_webview_window("main") {
+                                let _ = win.show();
+                                let _ = win.set_focus();
+                            }
+                        }
+                        TrayIconEvent::Click { .. } => { /* меню покажет сам таури */ }
+                        _ => {}
+                    }
+                })
+                .on_menu_event(|icon, event| {
+                    match event.id.as_ref() {
+                        "show" => {
+                            if let Some(win) = icon.app_handle().get_webview_window("main") {
+                                let _ = win.show();
+                                let _ = win.set_focus();
+                            }
+                        }
+                        "quit" => {
+                            // Грейсфул-шатдаун: отключаем TUN и чистим системный прокси перед выходом
+                            let app = icon.app_handle().clone();
+                            tauri::async_runtime::spawn(async move {
+                                let _ = disable_tun_mode().await;
+                                let _ = clear_system_proxy().await;
+                                let _ = app.exit(0);
+                            });
+                        }
+                        _ => {}
+                    }
+                })
+                .build(app)?;
+            Ok(())
+        })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                // Останавливаем закрытие до завершения очистки (одноразово)
-                static mut SHUTTING_DOWN: bool = false;
-                let do_cleanup = unsafe { if SHUTTING_DOWN { false } else { SHUTTING_DOWN = true; true } };
-                if do_cleanup {
-                    api.prevent_close();
-                    use tauri::Manager;
-                    let app = window.app_handle().clone();
-                    // Асинхронно останавливаем TUN/прокси и завершаем процесс
-                    tauri::async_runtime::spawn(async move {
-                        let _ = disable_tun_mode().await;
-                        let _ = clear_system_proxy().await;
-                        // disconnect_vpn требует window, но закрывать окно нам не нужно — завершаем app
-                        // Если нужно, можно вызвать disconnect_vpn через скрытое окно
-                        let _ = app.exit(0);
-                    });
-                }
+                // Сворачиваем в трей вместо выхода
+                api.prevent_close();
+                let _ = window.hide();
             }
         })
         .invoke_handler(tauri::generate_handler![
