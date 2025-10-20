@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use crab_sock::commands::*;
 use crab_sock::utils::init_logging;
 use crab_sock::config_manager::ConfigManager;
@@ -5,6 +7,29 @@ use crab_sock::config_manager::ConfigManager;
 use crab_sock::linux_capabilities::{has_cap_net_admin, set_cap_net_admin_via_pkexec, set_cap_net_admin_via_sudo};
 
 fn main() {
+    // On Windows release builds: if launched from an existing console (cmd/powershell),
+    // attach to it so stdout/stderr prints are visible. If started from Explorer, do nothing.
+    #[cfg(all(windows, not(debug_assertions)))]
+    {
+        use std::fs::OpenOptions;
+        use std::os::windows::io::IntoRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Console::{AttachConsole, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, STD_INPUT_HANDLE};
+        unsafe {
+            // Try to attach; ignore failure (means no parent console)
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+            if let Ok(f) = OpenOptions::new().write(true).open("CONOUT$") {
+                let h = HANDLE(f.into_raw_handle());
+                let _ = SetStdHandle(STD_OUTPUT_HANDLE, h);
+                let _ = SetStdHandle(STD_ERROR_HANDLE, h);
+            }
+            if let Ok(f) = OpenOptions::new().read(true).open("CONIN$") {
+                let h = HANDLE(f.into_raw_handle());
+                let _ = SetStdHandle(STD_INPUT_HANDLE, h);
+            }
+        }
+    }
+
     init_logging();
     log::info!("[MAIN] Starting CrabSock Tauri app");
 

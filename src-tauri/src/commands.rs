@@ -309,41 +309,152 @@ pub async fn start_connection_monitoring(window: tauri::Window) -> Result<(), St
 pub async fn get_ip() -> Result<IpInfo, String> {
     log::info!("[IP] Fetching external IP");
 
-    // Создаем клиент с SOCKS5 прокси, используя env SOCKS_PROXY если задан
-    let socks_env = std::env::var("SOCKS_PROXY").ok();
-    let proxy_builder = reqwest::Client::builder()
+    // Определяем текущий статус. Если Connected или Connecting — используем локальный SOCKS5, иначе ходим напрямую.
+    let status = {
+        let manager = PROXY_MANAGER.lock().await;
+        manager.get_status().await
+    };
+
+    let client_builder = reqwest::Client::builder()
         .pool_idle_timeout(std::time::Duration::from_secs(10))
         .tcp_keepalive(std::time::Duration::from_secs(10))
         .connect_timeout(std::time::Duration::from_secs(8))
         .timeout(std::time::Duration::from_secs(12))
         .no_proxy();
 
-    let client = if let Some(url) = socks_env {
-        proxy_builder
-            .proxy(reqwest::Proxy::all(&url).map_err(|e| format!("Failed to create SOCKS5 proxy from env: {}", e))?)
+    let client = if matches!(status, ConnectionStatus::Connected | ConnectionStatus::Connecting) {
+        // Используем SOCKS из env если задан, иначе стандартный локальный порт
+        let proxy_url = std::env::var("SOCKS_PROXY").unwrap_or_else(|_| "socks5h://127.0.0.1:1080".to_string());
+        client_builder
+            .proxy(reqwest::Proxy::all(&proxy_url).map_err(|e| format!("Failed to create SOCKS5 proxy: {}", e))?)
             .build()
+            .map_err(|e| format!("Failed to create proxied HTTP client: {}", e))?
     } else {
-        proxy_builder
-            .proxy(reqwest::Proxy::all("socks5h://127.0.0.1:1080").map_err(|e| format!("Failed to create SOCKS5 proxy: {}", e))?)
+        // Без прокси, чтобы получить реальный внешний IP пользователя
+        client_builder
             .build()
+            .map_err(|e| format!("Failed to create HTTP client: {}", e))?
+    };
+
+    // Набор публичных сервисов для получения IP. Идем по порядку, пока не получится.
+    // 1) ipinfo.io — ip + country
+    // 2) ipwho.is — ip + country_code
+    // 3) ip-api.com — query + countryCode
+    // 4) api.ipify.org — только ip
+    // 5) icanhazip.com — только ip (text/plain)
+    let mut last_error: Option<String> = None;
+
+    // ipinfo.io
+    if last_error.is_none() {
+        match client.get("https://ipinfo.io/json").send().await {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    match resp.json::<serde_json::Value>().await {
+                        Ok(json) => {
+                            if let Some(ip_str) = json.get("ip").and_then(|v| v.as_str()) {
+                                let country = json.get("country").and_then(|v| v.as_str()).map(|s| s.to_string());
+                                let ip = ip_str.to_string();
+                                log::info!("[IP] Fetched via ipinfo.io: {} {:?}", ip, country);
+                                return Ok(IpInfo { ip, country });
+                            }
+                        }
+                        Err(e) => { last_error = Some(format!("ipinfo parse error: {}", e)); }
+                    }
+                } else {
+                    last_error = Some(format!("ipinfo status: {}", resp.status()));
+                }
+            }
+            Err(e) => { last_error = Some(format!("ipinfo request error: {}", e)); }
+        }
     }
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
-    let resp = client.get("https://ipinfo.io/json")
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch IP info: {}", e))?;
+    // ipwho.is
+    match client.get("https://ipwho.is/").send().await {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(json) => {
+                        if let Some(ip_str) = json.get("ip").and_then(|v| v.as_str()) {
+                            let country = json.get("country_code").and_then(|v| v.as_str()).map(|s| s.to_string());
+                            let ip = ip_str.to_string();
+                            log::info!("[IP] Fetched via ipwho.is: {} {:?}", ip, country);
+                            return Ok(IpInfo { ip, country });
+                        }
+                    }
+                    Err(e) => { last_error = Some(format!("ipwho.is parse error: {}", e)); }
+                }
+            } else {
+                last_error = Some(format!("ipwho.is status: {}", resp.status()));
+            }
+        }
+        Err(e) => { last_error = Some(format!("ipwho.is request error: {}", e)); }
+    }
 
-    let json: serde_json::Value = resp.json()
-        .await
-        .map_err(|e| format!("Failed to parse IP JSON: {}", e))?;
+    // ip-api.com
+    match client.get("https://ip-api.com/json").send().await {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(json) => {
+                        if let Some(ip_str) = json.get("query").and_then(|v| v.as_str()) {
+                            let country = json.get("countryCode").and_then(|v| v.as_str()).map(|s| s.to_string());
+                            let ip = ip_str.to_string();
+                            log::info!("[IP] Fetched via ip-api.com: {} {:?}", ip, country);
+                            return Ok(IpInfo { ip, country });
+                        }
+                    }
+                    Err(e) => { last_error = Some(format!("ip-api parse error: {}", e)); }
+                }
+            } else {
+                last_error = Some(format!("ip-api status: {}", resp.status()));
+            }
+        }
+        Err(e) => { last_error = Some(format!("ip-api request error: {}", e)); }
+    }
 
-    let ip = json.get("ip").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let country = json.get("country").and_then(|v| v.as_str()).map(|s| s.to_string());
+    // api.ipify.org
+    match client.get("https://api.ipify.org?format=json").send().await {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(json) => {
+                        if let Some(ip_str) = json.get("ip").and_then(|v| v.as_str()) {
+                            let ip = ip_str.to_string();
+                            log::info!("[IP] Fetched via ipify: {}", ip);
+                            return Ok(IpInfo { ip, country: None });
+                        }
+                    }
+                    Err(e) => { last_error = Some(format!("ipify parse error: {}", e)); }
+                }
+            } else {
+                last_error = Some(format!("ipify status: {}", resp.status()));
+            }
+        }
+        Err(e) => { last_error = Some(format!("ipify request error: {}", e)); }
+    }
 
-    log::info!("[IP] Fetched IP: {}, Country: {:?}", ip, country);
+    // icanhazip.com (plain text)
+    match client.get("https://icanhazip.com").send().await {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                match resp.text().await {
+                    Ok(text) => {
+                        let ip = text.trim().to_string();
+                        if !ip.is_empty() {
+                            log::info!("[IP] Fetched via icanhazip: {}", ip);
+                            return Ok(IpInfo { ip, country: None });
+                        }
+                    }
+                    Err(e) => { last_error = Some(format!("icanhazip parse error: {}", e)); }
+                }
+            } else {
+                last_error = Some(format!("icanhazip status: {}", resp.status()));
+            }
+        }
+        Err(e) => { last_error = Some(format!("icanhazip request error: {}", e)); }
+    }
 
-    Ok(IpInfo { ip, country })
+    Err(last_error.unwrap_or_else(|| "Failed to fetch IP from all providers".to_string()))
 }
 
 // Команды для работы с конфигами

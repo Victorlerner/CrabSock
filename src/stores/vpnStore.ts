@@ -107,6 +107,12 @@ export const useVpnStore = defineStore('vpn', {
         console.log('[FRONTEND] Received status event:', payload)
         this.status = payload.status
         this.addLog('info', `Status changed to: ${payload.status}`, 'backend')
+        if (payload.status === 'disconnected') {
+          // При переходе в disconnected обновляем реальный внешний IP
+          this.refreshIp().catch(err => {
+            this.addLog('error', `Failed to refresh IP on disconnect: ${err}`, 'frontend')
+          })
+        }
       })
 
       // Listen for IP verification events
@@ -152,6 +158,13 @@ export const useVpnStore = defineStore('vpn', {
         this.addLog('info', 'Connection monitoring started', 'frontend')
       } catch (e) {
         this.addLog('error', `Failed to start monitoring: ${e}`, 'frontend')
+      }
+
+      // На старте приложения показываем текущий внешний IP (без VPN)
+      try {
+        await this.refreshIp()
+      } catch (e) {
+        // refreshIp уже залогирует ошибку
       }
     },
     
@@ -290,6 +303,8 @@ export const useVpnStore = defineStore('vpn', {
         this.status = 'disconnected'
         this.showConfig = true
         this.addLog('info', 'Disconnected successfully', 'frontend')
+        // После отключения показываем реальный IP
+        await this.refreshIp()
       } catch (e) {
         const errorMsg = `Disconnect failed: ${e}`
         this.setError(errorMsg)
