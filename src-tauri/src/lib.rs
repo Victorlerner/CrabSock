@@ -11,6 +11,7 @@ pub mod linux_capabilities;
 pub mod simple_proxy;
 pub mod optimized_shadowsocks;
 pub mod shadowsocks_socks5;
+pub mod windows_firewall;
 
 pub use error::VpnError;
 pub use config::*;

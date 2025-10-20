@@ -136,6 +136,16 @@ export const useVpnStore = defineStore('vpn', {
         this.addLog('info', `Connection updated: ${payload.status} ${payload.ip ? `(${payload.ip})` : ''}`, 'backend')
       })
 
+      // Listen for backend error events with details
+      listen('error', (e: any) => {
+        const payload = e.payload as { message?: string }
+        const msg = payload?.message || 'Unknown backend error'
+        console.log('[FRONTEND] Received error event:', msg)
+        this.addLog('error', msg, 'backend')
+        this.error = msg
+        this.status = 'disconnected'
+      })
+
       // Start connection monitoring
       try {
         await invoke('start_connection_monitoring')
@@ -334,8 +344,9 @@ export const useVpnStore = defineStore('vpn', {
       if (config.proxy_type === 'Shadowsocks') {
         const method = config.method || 'chacha20-ietf-poly1305'
         const password = config.password || ''
-        const encoded = btoa(`${method}:${password}@${config.server}:${config.port}`)
-        return `ss://${encoded}`
+        // Traditional format: ss://base64(method:password)@server:port
+        const creds = btoa(`${method}:${password}`)
+        return `ss://${creds}@${config.server}:${config.port}`
       } else if (config.proxy_type === 'VMess') {
         const vmessConfig = {
           v: '2',

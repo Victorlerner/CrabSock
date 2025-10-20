@@ -25,6 +25,7 @@ onMounted(() => store.init())
         <IpFlag />
       </header>
 
+
       <!-- Loading State -->
       <section v-if="store.status === 'connecting'" class="bg-white/70 dark:bg-neutral-800 rounded-xl border border-gray-200/60 dark:border-neutral-700">
         <LoadingSpinner />

@@ -4,6 +4,8 @@ use crate::config_manager::{ConfigManager, ConfigFile};
 use crate::system_proxy::{SystemProxyManager, ProxySettings};
 use crate::tun_manager::TunManager;
 use crate::linux_capabilities::has_cap_net_admin;
+#[cfg(target_os = "windows")]
+use crate::windows_firewall::ensure_firewall_rules_allow;
 use once_cell::sync::Lazy;
 use tokio::sync::Mutex;
 use serde::Serialize;
@@ -48,12 +50,15 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
 
     let result = {
         let manager = PROXY_MANAGER.lock().await;
-        manager.connect(config).await
+        manager.connect(config.clone()).await
     };
 
     match result {
         Ok(_) => {
             log::info!("[CONNECT] VPN proxy started successfully");
+            // On Windows, proactively allow app in firewall (single prompt, cached by checking existing rules)
+            #[cfg(target_os = "windows")]
+            if let Err(e) = ensure_firewall_rules_allow() { log::warn!("[CONNECT][WIN] firewall allow failed: {}", e); }
             
             // Ждем немного, чтобы прокси успел запуститься
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -78,6 +83,12 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                         Err(e) => println!("[STDOUT] Failed to send status event: {:?}", e),
                     }
                     
+                    // Помечаем прокси как Connected только после успешной проверки
+                    {
+                        let manager = PROXY_MANAGER.lock().await;
+                        manager.mark_connected().await;
+                    }
+
                     // Отправляем событие о верификации IP
                     println!("[STDOUT] Sending ip_verified event to frontend: ip={}, country={:?}", 
                         ip_info.ip, ip_info.country);
@@ -99,28 +110,83 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                 }
                 Err(e) => {
                     log::warn!("[CONNECT] VPN connected but IP verification failed: {}", e);
+                    // also reflect error in ProxyManager
+                    {
+                        let manager = PROXY_MANAGER.lock().await;
+                        manager.mark_error(e.clone()).await;
+                    }
                     
-                    // Даже если проверка IP не удалась, считаем подключение успешным
+                    // Не включаем системный прокси/TUN при провале проверки IP, чтобы не ломать сеть
                     let _ = window.emit("status", StatusEvent {
                         status: "connected".into(),
                     });
                     
-                    // Даже при неудачной проверке IP попробуем включить TUN
-                    if let Err(e2) = enable_tun_mode().await {
-                        log::warn!("[CONNECT] Failed to enable TUN mode automatically after IP check fail: {}", e2);
-                    }
-
-                    log::info!("[CONNECT] VPN connected (IP verification failed)");
+                    log::info!("[CONNECT] VPN connected (IP verification failed) - system proxy unchanged");
                     Ok(())
                 }
             }
         }
         Err(e) => {
-            log::error!("[CONNECT] VPN connection failed: {}", e);
-            let _ = window.emit("status", StatusEvent {
-                status: "disconnected".into(),
-            });
-            Err(e.to_string())
+            // If already connected/connecting, gracefully disconnect and retry once
+            if matches!(e, crate::error::VpnError::AlreadyConnected) {
+                log::warn!("[CONNECT] Already connected - attempting seamless reconnect with new config");
+                {
+                    let manager = PROXY_MANAGER.lock().await;
+                    let _ = manager.disconnect().await;
+                }
+                // brief pause to let tasks tear down sockets
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+                let retry = {
+                    let manager = PROXY_MANAGER.lock().await;
+                    manager.connect(config).await
+                };
+
+                match retry {
+                    Ok(_) => {
+                        log::info!("[CONNECT] Reconnect attempt started after seamless disconnect");
+                        // fall through to the same success path by recursively verifying IP
+                        // Ждем немного, чтобы прокси успел запуститься
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        match get_ip().await {
+                            Ok(ip_info) => {
+                                let _ = window.emit("status", StatusEvent { status: "connected".into() });
+                                {
+                                    let manager = PROXY_MANAGER.lock().await;
+                                    manager.mark_connected().await;
+                                }
+                                let _ = window.emit("ip_verified", ip_info);
+                                if let Err(e) = enable_tun_mode().await {
+                                    log::warn!("[CONNECT] Failed to enable TUN mode automatically: {}", e);
+                                }
+                                Ok(())
+                            }
+                            Err(e) => {
+                                log::warn!("[CONNECT] Reconnect started but IP verification failed: {}", e);
+                                {
+                                    let manager = PROXY_MANAGER.lock().await;
+                                    manager.mark_error(e.clone()).await;
+                                }
+                                let _ = window.emit("status", StatusEvent { status: "connected".into() });
+                                Ok(())
+                            }
+                        }
+                    }
+                    Err(e2) => {
+                        log::error!("[CONNECT] Reconnect failed: {}", e2);
+                        let _ = window.emit("error", serde_json::json!({ "message": e2.to_string() }));
+                        let _ = window.emit("status", StatusEvent { status: "disconnected".into() });
+                        Err(e2.to_string())
+                    }
+                }
+            } else {
+                log::error!("[CONNECT] VPN connection failed: {}", e);
+                let _ = window.emit("error", serde_json::json!({
+                    "message": e.to_string(),
+                }));
+                let _ = window.emit("status", StatusEvent { status: "disconnected".into() });
+                Err(e.to_string())
+            }
         }
     }
 }
@@ -243,11 +309,24 @@ pub async fn start_connection_monitoring(window: tauri::Window) -> Result<(), St
 pub async fn get_ip() -> Result<IpInfo, String> {
     log::info!("[IP] Fetching external IP");
 
-    // Создаем клиент с SOCKS5 прокси
-    let client = reqwest::Client::builder()
-        .proxy(reqwest::Proxy::all("socks5://127.0.0.1:1080")
-            .map_err(|e| format!("Failed to create SOCKS5 proxy: {}", e))?)
-        .build()
+    // Создаем клиент с SOCKS5 прокси, используя env SOCKS_PROXY если задан
+    let socks_env = std::env::var("SOCKS_PROXY").ok();
+    let proxy_builder = reqwest::Client::builder()
+        .pool_idle_timeout(std::time::Duration::from_secs(10))
+        .tcp_keepalive(std::time::Duration::from_secs(10))
+        .connect_timeout(std::time::Duration::from_secs(8))
+        .timeout(std::time::Duration::from_secs(12))
+        .no_proxy();
+
+    let client = if let Some(url) = socks_env {
+        proxy_builder
+            .proxy(reqwest::Proxy::all(&url).map_err(|e| format!("Failed to create SOCKS5 proxy from env: {}", e))?)
+            .build()
+    } else {
+        proxy_builder
+            .proxy(reqwest::Proxy::all("socks5h://127.0.0.1:1080").map_err(|e| format!("Failed to create SOCKS5 proxy: {}", e))?)
+            .build()
+    }
         .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
 
     let resp = client.get("https://ipinfo.io/json")
