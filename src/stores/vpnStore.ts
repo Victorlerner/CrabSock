@@ -53,7 +53,7 @@ export const useVpnStore = defineStore('vpn', {
     showConfig: true,
     logs: [] as LogEntry[],
     error: null as string | null,
-    showLogs: false,
+    showLogs: true,
     settings: {
       use_system_proxy: false,
       autorun: false,
@@ -107,6 +107,12 @@ export const useVpnStore = defineStore('vpn', {
         console.log('[FRONTEND] Received status event:', payload)
         this.status = payload.status
         this.addLog('info', `Status changed to: ${payload.status}`, 'backend')
+        if (payload.status === 'disconnected') {
+          // При переходе в disconnected обновляем реальный внешний IP
+          this.refreshIp().catch(err => {
+            this.addLog('error', `Failed to refresh IP on disconnect: ${err}`, 'frontend')
+          })
+        }
       })
 
       // Listen for IP verification events
@@ -136,12 +142,29 @@ export const useVpnStore = defineStore('vpn', {
         this.addLog('info', `Connection updated: ${payload.status} ${payload.ip ? `(${payload.ip})` : ''}`, 'backend')
       })
 
+      // Listen for backend error events with details
+      listen('error', (e: any) => {
+        const payload = e.payload as { message?: string }
+        const msg = payload?.message || 'Unknown backend error'
+        console.log('[FRONTEND] Received error event:', msg)
+        this.addLog('error', msg, 'backend')
+        this.error = msg
+        this.status = 'disconnected'
+      })
+
       // Start connection monitoring
       try {
         await invoke('start_connection_monitoring')
         this.addLog('info', 'Connection monitoring started', 'frontend')
       } catch (e) {
         this.addLog('error', `Failed to start monitoring: ${e}`, 'frontend')
+      }
+
+      // На старте приложения показываем текущий внешний IP (без VPN)
+      try {
+        await this.refreshIp()
+      } catch (e) {
+        // refreshIp уже залогирует ошибку
       }
     },
     
@@ -280,6 +303,8 @@ export const useVpnStore = defineStore('vpn', {
         this.status = 'disconnected'
         this.showConfig = true
         this.addLog('info', 'Disconnected successfully', 'frontend')
+        // После отключения показываем реальный IP
+        await this.refreshIp()
       } catch (e) {
         const errorMsg = `Disconnect failed: ${e}`
         this.setError(errorMsg)
@@ -334,8 +359,9 @@ export const useVpnStore = defineStore('vpn', {
       if (config.proxy_type === 'Shadowsocks') {
         const method = config.method || 'chacha20-ietf-poly1305'
         const password = config.password || ''
-        const encoded = btoa(`${method}:${password}@${config.server}:${config.port}`)
-        return `ss://${encoded}`
+        // Traditional format: ss://base64(method:password)@server:port
+        const creds = btoa(`${method}:${password}`)
+        return `ss://${creds}@${config.server}:${config.port}`
       } else if (config.proxy_type === 'VMess') {
         const vmessConfig = {
           v: '2',

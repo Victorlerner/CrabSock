@@ -2,6 +2,11 @@ use anyhow::Result;
 use std::process::Command;
 use std::process::Stdio;
 
+#[cfg(target_os = "windows")]
+use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+#[cfg(target_os = "windows")]
+use windows::Win32::Networking::WinInet::{InternetSetOptionW, INTERNET_OPTION_SETTINGS_CHANGED, INTERNET_OPTION_REFRESH};
+
 #[derive(Debug, Clone)]
 pub struct ProxySettings {
     pub http_proxy: Option<String>,
@@ -130,9 +135,14 @@ impl SystemProxyManager {
             std::env::remove_var("NO_PROXY");
         }
 
-        // Для Linux также устанавливаем системные настройки прокси через gsettings
-        if cfg!(target_os = "linux") {
+        // Apply system proxy per-OS
+        #[cfg(target_os = "linux")]
+        {
             self.set_linux_system_proxy(settings).await?;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            self.set_windows_system_proxy(settings).await?;
         }
 
         Ok(())
@@ -156,6 +166,64 @@ impl SystemProxyManager {
         }
         Ok(())
     }
+
+    #[cfg(target_os = "windows")]
+    async fn set_windows_system_proxy(&self, settings: &ProxySettings) -> Result<()> {
+        // Windows supports system-wide WinINET proxy for WinINet-aware apps. We'll set:
+        // HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings
+        //  - ProxyEnable (DWORD)
+        //  - ProxyServer (STRING) in format "socks=host:port" for SOCKS
+        //  - ProxyOverride (STRING)
+
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let path = "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
+        let (key, _) = hkcu.create_subkey(path)?;
+
+        if let Some(ref http_proxy) = settings.http_proxy {
+            // Prefer SOCKS5 overall if provided
+            let socks = settings
+                .socks_proxy
+                .as_ref()
+                .or(Some(http_proxy))
+                .cloned()
+                .unwrap();
+            // Normalize to socks=host:port
+            let proxy_str = if let Some(rest) = socks.strip_prefix("socks5://") {
+                format!("socks={}", rest)
+            } else if let Some(rest) = socks.strip_prefix("socks://") {
+                format!("socks={}", rest)
+            } else if let Some(rest) = socks.strip_prefix("http://") {
+                // fallback
+                rest.to_string()
+            } else {
+                format!("socks={}", socks)
+            };
+
+            key.set_value("ProxyEnable", &1u32)?;
+            key.set_value("ProxyServer", &proxy_str)?;
+
+            let override_val = settings
+                .no_proxy
+                .clone()
+                .unwrap_or_else(|| "localhost;127.0.0.1;<local>".to_string())
+                .replace(',', ";");
+            key.set_value("ProxyOverride", &override_val)?;
+        } else {
+            // disable proxy
+            key.set_value("ProxyEnable", &0u32)?;
+            let _ = key.delete_value("ProxyServer");
+        }
+
+        // Notify system
+        unsafe {
+            let _ = InternetSetOptionW(None, INTERNET_OPTION_SETTINGS_CHANGED, None, 0);
+            let _ = InternetSetOptionW(None, INTERNET_OPTION_REFRESH, None, 0);
+        }
+
+        Ok(())
+    }
+
+    
 
     pub async fn set_tun_mode(&mut self, enable: bool) -> Result<()> {
         log::info!("[SYSTEM_PROXY] Setting TUN mode: {}", enable);
@@ -199,8 +267,9 @@ impl SystemProxyManager {
             let empty_settings = ProxySettings::new();
             self.set_proxy_settings(&empty_settings).await?;
         }
-        // Также выключаем DE-прокси явно
-        if cfg!(target_os = "linux") {
+        // Also disable DE-proxy explicitly on Linux
+        #[cfg(target_os = "linux")]
+        {
             let de = detect_desktop_env();
             match de {
                 DesktopEnv::Gnome if which("gsettings") => {
@@ -209,9 +278,9 @@ impl SystemProxyManager {
                 DesktopEnv::Kde if which("kwriteconfig5") => {
                     // ProxyType=0 (No proxy)
                     let _ = Command::new("kwriteconfig5").args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "ProxyType", "0"]).output();
-                    // Убираем значения
+                    // Clear values
                     let _ = Command::new("kwriteconfig5").args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "socksProxy", ""]).output();
-                    // Применяем
+                    // Apply
                     let _ = Command::new("qdbus").args(["org.kde.kded5", "/kded", "reconfigure"]).stdout(Stdio::null()).stderr(Stdio::null()).output();
                 }
                 _ => {}

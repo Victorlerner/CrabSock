@@ -1,9 +1,11 @@
 use crate::config::ProxyConfig;
 use crate::proxy::{ProxyManager, ConnectionStatus};
-use crate::config_manager::{ConfigManager, ConfigFile, AppSettings};
+use crate::config_manager::{ConfigManager, ConfigFile};
 use crate::system_proxy::{SystemProxyManager, ProxySettings};
 use crate::tun_manager::TunManager;
-use crate::linux_capabilities::{has_cap_net_admin, set_cap_net_admin_via_pkexec, set_cap_net_admin_via_sudo};
+use crate::linux_capabilities::has_cap_net_admin;
+#[cfg(target_os = "windows")]
+use crate::windows_firewall::ensure_firewall_rules_allow;
 use once_cell::sync::Lazy;
 use tokio::sync::Mutex;
 use serde::Serialize;
@@ -48,12 +50,15 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
 
     let result = {
         let manager = PROXY_MANAGER.lock().await;
-        manager.connect(config).await
+        manager.connect(config.clone()).await
     };
 
     match result {
         Ok(_) => {
             log::info!("[CONNECT] VPN proxy started successfully");
+            // On Windows, proactively allow app in firewall (single prompt, cached by checking existing rules)
+            #[cfg(target_os = "windows")]
+            if let Err(e) = ensure_firewall_rules_allow() { log::warn!("[CONNECT][WIN] firewall allow failed: {}", e); }
             
             // Ждем немного, чтобы прокси успел запуститься
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
@@ -78,6 +83,12 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                         Err(e) => println!("[STDOUT] Failed to send status event: {:?}", e),
                     }
                     
+                    // Помечаем прокси как Connected только после успешной проверки
+                    {
+                        let manager = PROXY_MANAGER.lock().await;
+                        manager.mark_connected().await;
+                    }
+
                     // Отправляем событие о верификации IP
                     println!("[STDOUT] Sending ip_verified event to frontend: ip={}, country={:?}", 
                         ip_info.ip, ip_info.country);
@@ -89,28 +100,93 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                         Err(e) => println!("[STDOUT] Failed to send ip_verified event: {:?}", e),
                     }
                     
+                    // Автоматически включаем TUN после успешного подключения
+                    if let Err(e) = enable_tun_mode().await {
+                        log::warn!("[CONNECT] Failed to enable TUN mode automatically: {}", e);
+                    }
+
                     log::info!("[CONNECT] VPN connected and verified successfully");
                     Ok(())
                 }
                 Err(e) => {
                     log::warn!("[CONNECT] VPN connected but IP verification failed: {}", e);
+                    // also reflect error in ProxyManager
+                    {
+                        let manager = PROXY_MANAGER.lock().await;
+                        manager.mark_error(e.clone()).await;
+                    }
                     
-                    // Даже если проверка IP не удалась, считаем подключение успешным
+                    // Не включаем системный прокси/TUN при провале проверки IP, чтобы не ломать сеть
                     let _ = window.emit("status", StatusEvent {
                         status: "connected".into(),
                     });
                     
-                    log::info!("[CONNECT] VPN connected (IP verification failed)");
+                    log::info!("[CONNECT] VPN connected (IP verification failed) - system proxy unchanged");
                     Ok(())
                 }
             }
         }
         Err(e) => {
-            log::error!("[CONNECT] VPN connection failed: {}", e);
-            let _ = window.emit("status", StatusEvent {
-                status: "disconnected".into(),
-            });
-            Err(e.to_string())
+            // If already connected/connecting, gracefully disconnect and retry once
+            if matches!(e, crate::error::VpnError::AlreadyConnected) {
+                log::warn!("[CONNECT] Already connected - attempting seamless reconnect with new config");
+                {
+                    let manager = PROXY_MANAGER.lock().await;
+                    let _ = manager.disconnect().await;
+                }
+                // brief pause to let tasks tear down sockets
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+                let retry = {
+                    let manager = PROXY_MANAGER.lock().await;
+                    manager.connect(config).await
+                };
+
+                match retry {
+                    Ok(_) => {
+                        log::info!("[CONNECT] Reconnect attempt started after seamless disconnect");
+                        // fall through to the same success path by recursively verifying IP
+                        // Ждем немного, чтобы прокси успел запуститься
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        match get_ip().await {
+                            Ok(ip_info) => {
+                                let _ = window.emit("status", StatusEvent { status: "connected".into() });
+                                {
+                                    let manager = PROXY_MANAGER.lock().await;
+                                    manager.mark_connected().await;
+                                }
+                                let _ = window.emit("ip_verified", ip_info);
+                                if let Err(e) = enable_tun_mode().await {
+                                    log::warn!("[CONNECT] Failed to enable TUN mode automatically: {}", e);
+                                }
+                                Ok(())
+                            }
+                            Err(e) => {
+                                log::warn!("[CONNECT] Reconnect started but IP verification failed: {}", e);
+                                {
+                                    let manager = PROXY_MANAGER.lock().await;
+                                    manager.mark_error(e.clone()).await;
+                                }
+                                let _ = window.emit("status", StatusEvent { status: "connected".into() });
+                                Ok(())
+                            }
+                        }
+                    }
+                    Err(e2) => {
+                        log::error!("[CONNECT] Reconnect failed: {}", e2);
+                        let _ = window.emit("error", serde_json::json!({ "message": e2.to_string() }));
+                        let _ = window.emit("status", StatusEvent { status: "disconnected".into() });
+                        Err(e2.to_string())
+                    }
+                }
+            } else {
+                log::error!("[CONNECT] VPN connection failed: {}", e);
+                let _ = window.emit("error", serde_json::json!({
+                    "message": e.to_string(),
+                }));
+                let _ = window.emit("status", StatusEvent { status: "disconnected".into() });
+                Err(e.to_string())
+            }
         }
     }
 }
@@ -118,6 +194,11 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
 #[tauri::command]
 pub async fn disconnect_vpn(window: tauri::Window) -> Result<(), String> {
     log::info!("[DISCONNECT] Disconnecting VPN");
+
+    // Сначала отключаем TUN и системный прокси. Делаем это в отдельной задаче, чтобы жесткий трафик мог завершиться корректно
+    let tun_task = tauri::async_runtime::spawn(async move {
+        let _ = disable_tun_mode().await;
+    });
 
     let result = {
         let manager = PROXY_MANAGER.lock().await;
@@ -130,6 +211,7 @@ pub async fn disconnect_vpn(window: tauri::Window) -> Result<(), String> {
                 status: "disconnected".into(),
             });
 
+            let _ = tun_task.await; // дожидаемся выключения TUN
             log::info!("[DISCONNECT] VPN disconnected");
             Ok(())
         }
@@ -227,28 +309,152 @@ pub async fn start_connection_monitoring(window: tauri::Window) -> Result<(), St
 pub async fn get_ip() -> Result<IpInfo, String> {
     log::info!("[IP] Fetching external IP");
 
-    // Создаем клиент с SOCKS5 прокси
-    let client = reqwest::Client::builder()
-        .proxy(reqwest::Proxy::all("socks5://127.0.0.1:1080")
-            .map_err(|e| format!("Failed to create SOCKS5 proxy: {}", e))?)
-        .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+    // Определяем текущий статус. Если Connected или Connecting — используем локальный SOCKS5, иначе ходим напрямую.
+    let status = {
+        let manager = PROXY_MANAGER.lock().await;
+        manager.get_status().await
+    };
 
-    let resp = client.get("https://ipinfo.io/json")
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch IP info: {}", e))?;
+    let client_builder = reqwest::Client::builder()
+        .pool_idle_timeout(std::time::Duration::from_secs(10))
+        .tcp_keepalive(std::time::Duration::from_secs(10))
+        .connect_timeout(std::time::Duration::from_secs(8))
+        .timeout(std::time::Duration::from_secs(12))
+        .no_proxy();
 
-    let json: serde_json::Value = resp.json()
-        .await
-        .map_err(|e| format!("Failed to parse IP JSON: {}", e))?;
+    let client = if matches!(status, ConnectionStatus::Connected | ConnectionStatus::Connecting) {
+        // Используем SOCKS из env если задан, иначе стандартный локальный порт
+        let proxy_url = std::env::var("SOCKS_PROXY").unwrap_or_else(|_| "socks5h://127.0.0.1:1080".to_string());
+        client_builder
+            .proxy(reqwest::Proxy::all(&proxy_url).map_err(|e| format!("Failed to create SOCKS5 proxy: {}", e))?)
+            .build()
+            .map_err(|e| format!("Failed to create proxied HTTP client: {}", e))?
+    } else {
+        // Без прокси, чтобы получить реальный внешний IP пользователя
+        client_builder
+            .build()
+            .map_err(|e| format!("Failed to create HTTP client: {}", e))?
+    };
 
-    let ip = json.get("ip").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let country = json.get("country").and_then(|v| v.as_str()).map(|s| s.to_string());
+    // Набор публичных сервисов для получения IP. Идем по порядку, пока не получится.
+    // 1) ipinfo.io — ip + country
+    // 2) ipwho.is — ip + country_code
+    // 3) ip-api.com — query + countryCode
+    // 4) api.ipify.org — только ip
+    // 5) icanhazip.com — только ip (text/plain)
+    let mut last_error: Option<String> = None;
 
-    log::info!("[IP] Fetched IP: {}, Country: {:?}", ip, country);
+    // ipinfo.io
+    if last_error.is_none() {
+        match client.get("https://ipinfo.io/json").send().await {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    match resp.json::<serde_json::Value>().await {
+                        Ok(json) => {
+                            if let Some(ip_str) = json.get("ip").and_then(|v| v.as_str()) {
+                                let country = json.get("country").and_then(|v| v.as_str()).map(|s| s.to_string());
+                                let ip = ip_str.to_string();
+                                log::info!("[IP] Fetched via ipinfo.io: {} {:?}", ip, country);
+                                return Ok(IpInfo { ip, country });
+                            }
+                        }
+                        Err(e) => { last_error = Some(format!("ipinfo parse error: {}", e)); }
+                    }
+                } else {
+                    last_error = Some(format!("ipinfo status: {}", resp.status()));
+                }
+            }
+            Err(e) => { last_error = Some(format!("ipinfo request error: {}", e)); }
+        }
+    }
 
-    Ok(IpInfo { ip, country })
+    // ipwho.is
+    match client.get("https://ipwho.is/").send().await {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(json) => {
+                        if let Some(ip_str) = json.get("ip").and_then(|v| v.as_str()) {
+                            let country = json.get("country_code").and_then(|v| v.as_str()).map(|s| s.to_string());
+                            let ip = ip_str.to_string();
+                            log::info!("[IP] Fetched via ipwho.is: {} {:?}", ip, country);
+                            return Ok(IpInfo { ip, country });
+                        }
+                    }
+                    Err(e) => { last_error = Some(format!("ipwho.is parse error: {}", e)); }
+                }
+            } else {
+                last_error = Some(format!("ipwho.is status: {}", resp.status()));
+            }
+        }
+        Err(e) => { last_error = Some(format!("ipwho.is request error: {}", e)); }
+    }
+
+    // ip-api.com
+    match client.get("https://ip-api.com/json").send().await {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(json) => {
+                        if let Some(ip_str) = json.get("query").and_then(|v| v.as_str()) {
+                            let country = json.get("countryCode").and_then(|v| v.as_str()).map(|s| s.to_string());
+                            let ip = ip_str.to_string();
+                            log::info!("[IP] Fetched via ip-api.com: {} {:?}", ip, country);
+                            return Ok(IpInfo { ip, country });
+                        }
+                    }
+                    Err(e) => { last_error = Some(format!("ip-api parse error: {}", e)); }
+                }
+            } else {
+                last_error = Some(format!("ip-api status: {}", resp.status()));
+            }
+        }
+        Err(e) => { last_error = Some(format!("ip-api request error: {}", e)); }
+    }
+
+    // api.ipify.org
+    match client.get("https://api.ipify.org?format=json").send().await {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(json) => {
+                        if let Some(ip_str) = json.get("ip").and_then(|v| v.as_str()) {
+                            let ip = ip_str.to_string();
+                            log::info!("[IP] Fetched via ipify: {}", ip);
+                            return Ok(IpInfo { ip, country: None });
+                        }
+                    }
+                    Err(e) => { last_error = Some(format!("ipify parse error: {}", e)); }
+                }
+            } else {
+                last_error = Some(format!("ipify status: {}", resp.status()));
+            }
+        }
+        Err(e) => { last_error = Some(format!("ipify request error: {}", e)); }
+    }
+
+    // icanhazip.com (plain text)
+    match client.get("https://icanhazip.com").send().await {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                match resp.text().await {
+                    Ok(text) => {
+                        let ip = text.trim().to_string();
+                        if !ip.is_empty() {
+                            log::info!("[IP] Fetched via icanhazip: {}", ip);
+                            return Ok(IpInfo { ip, country: None });
+                        }
+                    }
+                    Err(e) => { last_error = Some(format!("icanhazip parse error: {}", e)); }
+                }
+            } else {
+                last_error = Some(format!("icanhazip status: {}", resp.status()));
+            }
+        }
+        Err(e) => { last_error = Some(format!("icanhazip request error: {}", e)); }
+    }
+
+    Err(last_error.unwrap_or_else(|| "Failed to fetch IP from all providers".to_string()))
 }
 
 // Команды для работы с конфигами
@@ -294,19 +500,7 @@ pub async fn remove_config(config: ProxyConfig) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-pub async fn update_settings(settings: AppSettings) -> Result<(), String> {
-    log::info!("[CONFIG] Updating settings");
-    
-    let config_manager = ConfigManager::new()
-        .map_err(|e| format!("Failed to create config manager: {}", e))?;
-    
-    config_manager.update_settings(settings).await
-        .map_err(|e| format!("Failed to update settings: {}", e))?;
-    
-    log::info!("[CONFIG] Settings updated successfully");
-    Ok(())
-}
+// removed update_settings: settings UI eliminated
 
 #[tauri::command]
 pub async fn get_config_path() -> Result<String, String> {
@@ -470,132 +664,3 @@ pub async fn is_tun_mode_enabled() -> Result<bool, String> {
     Ok(system_manager.is_tun_mode())
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct TunPermissionResult {
-    pub success: bool,
-    pub message: String,
-    pub needs_restart: bool,
-}
-
-#[tauri::command]
-pub async fn request_tun_permissions() -> Result<TunPermissionResult, String> {
-    log::info!("[TUN] Requesting TUN permissions");
-    println!("[STDOUT] TUN: Requesting TUN permissions");
-    
-    println!("[STDOUT] TUN: Setting capability via pkexec");
-    match set_cap_net_admin_via_pkexec() {
-        Ok(_) => {
-                println!("[STDOUT] TUN: Capability set successfully");
-                log::info!("[TUN] Capability set successfully");
-                
-                Ok(TunPermissionResult {
-                    success: true,
-                    message: "Permissions granted successfully. Please build release version for TUN Mode.".to_string(),
-                    needs_restart: true,
-                })
-        }
-        Err(error) => Ok(TunPermissionResult {
-            success: false,
-            message: error,
-            needs_restart: false,
-        })
-    }
-}
-
-#[tauri::command]
-pub async fn restart_application() -> Result<(), String> {
-    log::info!("[TUN] Restart application requested - but we don't restart in development mode");
-    println!("[STDOUT] TUN: Restart application requested - but we don't restart in development mode");
-    
-    // В development mode не перезапускаем приложение
-    // Вместо этого просто возвращаем успех
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn request_tun_permissions_sudo() -> Result<TunPermissionResult, String> {
-    log::info!("[TUN] Requesting TUN permissions via sudo");
-    println!("[STDOUT] TUN: Requesting TUN permissions via sudo");
-    
-    println!("[STDOUT] TUN: Setting capability cap_net_admin=ep via sudo");
-    match set_cap_net_admin_via_sudo() {
-        Ok(_) => {
-                println!("[STDOUT] TUN: Capability set successfully via sudo");
-                log::info!("[TUN] Capability set successfully via sudo");
-                
-                Ok(TunPermissionResult {
-                    success: true,
-                    message: "Permissions granted successfully via sudo. Please build release version for TUN Mode.".to_string(),
-                    needs_restart: true,
-                })
-        }
-        Err(error) => Ok(TunPermissionResult {
-            success: false,
-            message: error,
-            needs_restart: false,
-        })
-    }
-}
-
-#[tauri::command]
-pub async fn check_tun_capability_command() -> Result<bool, String> {
-    Ok(has_cap_net_admin())
-}
-
-#[tauri::command]
-pub async fn build_release_version() -> Result<String, String> {
-    log::info!("[BUILD] Building release version");
-    println!("[STDOUT] BUILD: Building release version");
-    
-    // Получаем путь к проекту Tauri
-    let project_path = std::env::current_dir()
-        .map_err(|e| format!("Failed to get current directory: {}", e))?
-        .join("src-tauri");
-    
-    println!("[STDOUT] BUILD: Project path: {}", project_path.display());
-    
-    // Запускаем сборку
-    let output = std::process::Command::new("cargo")
-        .args(&["build", "--release"])
-        .current_dir(&project_path)
-        .output();
-    
-    match output {
-        Ok(output) => {
-            if output.status.success() {
-                let release_path = project_path.join("target/release/crab-sock");
-                println!("[STDOUT] BUILD: Release build successful: {}", release_path.display());
-                
-                // Устанавливаем capability для release версии
-                let setcap_output = std::process::Command::new("sudo")
-                    .args(&["setcap", "cap_net_admin=ep", &release_path.to_string_lossy()])
-                    .output();
-                
-                match setcap_output {
-                    Ok(setcap_output) => {
-                        if setcap_output.status.success() {
-                            println!("[STDOUT] BUILD: Capability set for release version");
-                            Ok(format!("Release version built successfully: {}", release_path.display()))
-                        } else {
-                            let error = String::from_utf8_lossy(&setcap_output.stderr);
-                            println!("[STDOUT] BUILD: Failed to set capability: {}", error);
-                            Ok(format!("Release version built but capability setting failed: {}", error))
-                        }
-                    }
-                    Err(e) => {
-                        println!("[STDOUT] BUILD: Failed to run pkexec: {}", e);
-                        Ok(format!("Release version built but capability setting failed: {}", e))
-                    }
-                }
-            } else {
-                let error = String::from_utf8_lossy(&output.stderr);
-                println!("[STDOUT] BUILD: Build failed: {}", error);
-                Err(format!("Build failed: {}", error))
-            }
-        }
-        Err(e) => {
-            println!("[STDOUT] BUILD: Failed to run cargo: {}", e);
-            Err(format!("Failed to run cargo: {}", e))
-        }
-    }
-}

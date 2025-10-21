@@ -2,9 +2,7 @@
 import ConfigInput from '@src/components/ConfigInput.vue'
 import ConnectButton from '@src/components/ConnectButton.vue'
 import IpFlag from '@src/components/IpFlag.vue'
-import SettingsPanel from '@src/components/Settings.vue'
 import LoadingSpinner from '@src/components/LoadingSpinner.vue'
-import ConnectedView from '@src/components/ConnectedView.vue'
 import ConfigList from '@src/components/ConfigList.vue'
 import LogsPanel from '@src/components/LogsPanel.vue'
 import ConnectionStatus from '@src/components/ConnectionStatus.vue'
@@ -19,9 +17,14 @@ onMounted(() => store.init())
   <div class="min-h-full bg-gray-50 dark:bg-neutral-900 text-gray-900 dark:text-gray-100">
     <div class="mx-auto max-w-4xl p-6 space-y-6">
       <header class="flex items-center justify-between">
-        <h1 class="text-2xl font-semibold">CrabSock</h1>
+        <img src="/app-icon.png" alt="App icon" class="w-16 h-16" />
+        <div class="flex items-center gap-2">
+         
+          <h1 class="text-2xl font-semibold">CrabSock</h1>
+        </div>
         <IpFlag />
       </header>
+
 
       <!-- Loading State -->
       <section v-if="store.status === 'connecting'" class="bg-white/70 dark:bg-neutral-800 rounded-xl border border-gray-200/60 dark:border-neutral-700">
@@ -40,10 +43,10 @@ onMounted(() => store.init())
             <ConfigInput />
           </section>
 
+
           <!-- Connect Button -->
-          <section class="flex items-center gap-3">
+          <section  v-if="!store.showConfig" class="flex items-center gap-3">
             <ConnectButton />
-            <SettingsPanel />
           </section>
         </div>
 

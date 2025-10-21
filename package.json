@@ -7,9 +7,13 @@
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
+    "icons:desktop": "tauri icon ./public/app-icon.png -o src-tauri/icons",
+    "icons:web": "tauri icon ./public/app-icon.png -o public/icons --png 16,32,48,64,128,180,192,256,512",
+    "icons:all": "npm run icons:desktop && npm run icons:web",
     "tauri:dev": "tauri dev",
-    "tauri:dev:linux": "GDK_BACKEND=x11 DISPLAY=$DISPLAY XAUTHORITY=$XAUTHORITY WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_SANDBOX=1 tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:dev:linux": "WEBKIT_DISABLE_DMABUF_RENDERER=1  tauri dev",
+    "tauri:build": "WEBKIT_DISABLE_DMABUF_RENDERER=1  npm run icons:all && tauri build",
+    "arch:build": "cd arch && makepkg -si --noconfirm"
   },
   "dependencies": {
     "@tauri-apps/api": "2.0.0",
