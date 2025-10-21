@@ -49,6 +49,14 @@ pub struct ProxyConfig {
 }
 
 impl ProxyConfig {
+    pub fn masked(&self) -> Self {
+        let mut cloned = self.clone();
+        if let Some(ref pwd) = cloned.password {
+            cloned.password = Some("*".repeat(pwd.chars().count()));
+        }
+        cloned
+    }
+
     pub fn from_ss_url(url: &str) -> VpnResult<Self> {
         if !url.starts_with("ss://") {
             return Err(VpnError::InvalidConfig("Not a Shadowsocks URL".to_string()));

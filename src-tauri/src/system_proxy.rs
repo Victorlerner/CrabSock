@@ -144,6 +144,10 @@ impl SystemProxyManager {
         {
             self.set_windows_system_proxy(settings).await?;
         }
+        #[cfg(target_os = "macos")]
+        {
+            self.set_macos_system_proxy(settings).await?;
+        }
 
         Ok(())
     }
@@ -218,6 +222,162 @@ impl SystemProxyManager {
         unsafe {
             let _ = InternetSetOptionW(None, INTERNET_OPTION_SETTINGS_CHANGED, None, 0);
             let _ = InternetSetOptionW(None, INTERNET_OPTION_REFRESH, None, 0);
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn set_macos_system_proxy(&self, settings: &ProxySettings) -> Result<()> {
+        // On macOS we configure SOCKS proxy using `networksetup` for all network services
+        // We intentionally only set SOCKS to keep HTTP/HTTPS untouched
+        let services = list_macos_network_services();
+
+        // Determine host:port from provided settings (prefer SOCKS5)
+        let maybe_socks = settings
+            .socks_proxy
+            .as_ref()
+            .or(settings.http_proxy.as_ref())
+            .cloned();
+
+        if let Some(socks_url) = maybe_socks {
+            // Normalize to host, port
+            let (host, port) = parse_socks_host_port(&socks_url).unwrap_or(("127.0.0.1".to_string(), 1080u16));
+
+            for service in services {
+                // networksetup -setsocksfirewallproxy "Wi-Fi" host port
+                let _ = std::process::Command::new("networksetup")
+                    .arg("-setsocksfirewallproxy")
+                    .arg(&service)
+                    .arg(&host)
+                    .arg(port.to_string())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+
+                // Enable
+                let _ = std::process::Command::new("networksetup")
+                    .arg("-setsocksfirewallproxystate")
+                    .arg(&service)
+                    .arg("on")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+
+                // Bypass domains if provided
+                if let Some(ref bypass) = settings.no_proxy {
+                    let domains: Vec<String> = bypass
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if !domains.is_empty() {
+                        let mut cmd = std::process::Command::new("networksetup");
+                        cmd.arg("-setproxybypassdomains").arg(&service);
+                        for d in domains { cmd.arg(d); }
+                        let _ = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+                    }
+                }
+            }
+
+            // Additionally set HTTP/HTTPS proxies for better browser compatibility
+            for service in list_macos_network_services() {
+                let _ = std::process::Command::new("networksetup")
+                    .arg("-setwebproxy")
+                    .arg(&service)
+                    .arg(&host)
+                    .arg("8080")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                let _ = std::process::Command::new("networksetup")
+                    .arg("-setsecurewebproxy")
+                    .arg(&service)
+                    .arg(&host)
+                    .arg("8080")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                // toggle HTTP off→on to force apply
+                let _ = std::process::Command::new("networksetup")
+                    .arg("-setwebproxystate")
+                    .arg(&service)
+                    .arg("off")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                let _ = std::process::Command::new("networksetup")
+                    .arg("-setwebproxystate")
+                    .arg(&service)
+                    .arg("on")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                // toggle HTTPS off→on to force apply
+                let _ = std::process::Command::new("networksetup")
+                    .arg("-setsecurewebproxystate")
+                    .arg(&service)
+                    .arg("off")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                let _ = std::process::Command::new("networksetup")
+                    .arg("-setsecurewebproxystate")
+                    .arg(&service)
+                    .arg("on")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                // toggle SOCKS off→on to force apply
+                let _ = std::process::Command::new("networksetup")
+                    .arg("-setsocksfirewallproxystate")
+                    .arg(&service)
+                    .arg("off")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                let _ = std::process::Command::new("networksetup")
+                    .arg("-setsocksfirewallproxystate")
+                    .arg(&service)
+                    .arg("on")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+
+            // Verify using scutil --proxy (best-effort)
+            if verify_macos_proxies() {
+                log::info!("[SYSTEM_PROXY][macOS] Proxies set: HTTP/HTTPS 127.0.0.1:8080, SOCKS {}:{}", host, port);
+            } else {
+                log::warn!("[SYSTEM_PROXY][macOS] Attempted to set SOCKS proxy, but verification failed via scutil --proxy");
+            }
+        } else {
+            // Disable SOCKS proxy on all services
+            for service in services {
+                let _ = std::process::Command::new("networksetup")
+                    .arg("-setsocksfirewallproxystate")
+                    .arg(&service)
+                    .arg("off")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                // Also disable HTTP/HTTPS
+                let _ = std::process::Command::new("networksetup")
+                    .arg("-setwebproxystate")
+                    .arg(&service)
+                    .arg("off")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                let _ = std::process::Command::new("networksetup")
+                    .arg("-setsecurewebproxystate")
+                    .arg(&service)
+                    .arg("off")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+            log::info!("[SYSTEM_PROXY][macOS] SOCKS proxy disabled for all services");
         }
 
         Ok(())
@@ -369,4 +529,54 @@ impl Default for SystemProxyManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[cfg(target_os = "macos")]
+fn list_macos_network_services() -> Vec<String> {
+    // Parse `networksetup -listallnetworkservices` and skip header and disabled services (prefixed with '*')
+    let output = std::process::Command::new("networksetup").arg("-listallnetworkservices").output();
+    if let Ok(out) = output {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            let mut services: Vec<String> = Vec::new();
+            for raw in text.lines() {
+                let line = raw.trim();
+                if line.is_empty() { continue; }
+                if line.starts_with("An asterisk (") { continue; }
+                // Skip disabled services (start with '* ')
+                if line.starts_with('*') { continue; }
+                services.push(line.to_string());
+            }
+            if !services.is_empty() { return services; }
+        }
+    }
+    // Fallback to common service names
+    vec!["Wi-Fi".to_string(), "Ethernet".to_string()]
+}
+
+#[cfg(target_os = "macos")]
+fn parse_socks_host_port(url: &str) -> Option<(String, u16)> {
+    // Accept formats: socks5://host:port, socks://host:port, host:port
+    let trimmed = url
+        .strip_prefix("socks5://")
+        .or_else(|| url.strip_prefix("socks://"))
+        .unwrap_or(url);
+    let (host, port_str) = trimmed.split_once(':')?;
+    let port = port_str.parse::<u16>().ok()?;
+    Some((host.to_string(), port))
+}
+
+#[cfg(target_os = "macos")]
+fn verify_macos_proxies() -> bool {
+    // scutil --proxy prints a plist-like dictionary; check that HTTP, HTTPS or SOCKS are enabled
+    if let Ok(out) = std::process::Command::new("scutil").arg("--proxy").output() {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
+            let http_on = text.contains("httpenable : 1") && text.contains("httpproxy : 127.0.0.1") && text.contains("httpport : 8080");
+            let https_on = text.contains("httpsenable : 1") && text.contains("httpsproxy : 127.0.0.1") && text.contains("httpsport : 8080");
+            let socks_on = text.contains("socksenable : 1");
+            return http_on || https_on || socks_on;
+        }
+    }
+    false
 }

@@ -35,18 +35,32 @@ pub struct ConnectionEvent {
 
 #[tauri::command]
 pub async fn parse_proxy_config(config_string: String) -> Result<ProxyConfig, String> {
-    log::info!("[PARSE] Received config string: {}", config_string);
+    // Do not log secrets; only log scheme
+    let scheme = if config_string.starts_with("ss://") {
+        "ss"
+    } else if config_string.starts_with("vmess://") {
+        "vmess"
+    } else if config_string.starts_with("vless://") {
+        "vless"
+    } else if config_string.starts_with("trojan://") {
+        "trojan"
+    } else {
+        "unknown"
+    };
+    log::info!("[PARSE] Received config string (scheme={}): [REDACTED]", scheme);
 
     let config = ProxyConfig::from_config_string(&config_string)
         .map_err(|e| e.to_string())?;
 
-    log::info!("[PARSE] Successfully parsed config: {:?}", config);
+    // Log masked config (password replaced by asterisks of equal length)
+    log::info!("[PARSE] Successfully parsed config: {:?}", config.masked());
     Ok(config)
 }
 
 #[tauri::command]
 pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(), String> {
-    log::info!("[CONNECT] Starting VPN connection with config: {:?}", config);
+    // Log masked config to avoid leaking secrets
+    log::info!("[CONNECT] Starting VPN connection with config: {:?}", config.masked());
 
     let result = {
         let manager = PROXY_MANAGER.lock().await;

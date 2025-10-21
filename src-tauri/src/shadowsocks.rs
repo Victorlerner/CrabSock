@@ -46,7 +46,15 @@ impl ShadowsocksClient {
         local_config.addr = Some(local_addr);
         config.local.push(LocalInstanceConfig::with_local_config(local_config));
 
+        // Also expose an HTTP proxy for browsers that don't honor system SOCKS
+        let http_local_addr = ServerAddr::from_str("127.0.0.1:8080")
+            .map_err(|e| format!("Failed to parse HTTP local address: {}", e))?;
+        let mut http_local_config = LocalConfig::new(ProtocolType::Http);
+        http_local_config.addr = Some(http_local_addr);
+        config.local.push(LocalInstanceConfig::with_local_config(http_local_config));
+
         log::info!("SOCKS5 proxy listening on 127.0.0.1:1080");
+        log::info!("HTTP proxy listening on 127.0.0.1:8080");
 
         // Create and run the local server with timeout
         let server = Server::new(config).await
