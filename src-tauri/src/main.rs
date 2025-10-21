@@ -84,8 +84,8 @@ fn main() {
             // Создаем трей-иконку и обрабатываем клики для показа окна
             let icon = app.default_window_icon().cloned().expect("default window icon missing");
             // Трей-меню
-            let show_item = MenuItem::with_id(app, "show", "Показать", true, None::<&str>)?;
-            let quit_item = MenuItem::with_id(app, "quit", "Закрыть", true, None::<&str>)?;
+            let show_item = MenuItem::with_id(app, "show", "Show app", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "Quit app", true, None::<&str>)?;
             let menu = Menu::new(app)?;
             menu.append(&show_item)?;
             menu.append(&quit_item)?;
