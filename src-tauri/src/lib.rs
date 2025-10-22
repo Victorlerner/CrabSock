@@ -12,6 +12,7 @@ pub mod simple_proxy;
 pub mod optimized_shadowsocks;
 pub mod shadowsocks_socks5;
 pub mod windows_firewall;
+pub mod acl_http_proxy;
 
 pub use error::VpnError;
 pub use config::*;

@@ -31,7 +31,44 @@ impl ProxySettings {
             http_proxy: Some(proxy_url.clone()),
             https_proxy: Some(proxy_url.clone()),
             socks_proxy: Some(proxy_url),
-            no_proxy: Some("localhost,127.0.0.1,::1".to_string()),
+            // By default bypass localhost,  and private IP ranges
+            // This mirrors Outline behavior where private networks are excluded from the tunnel
+            no_proxy: Some([
+                // loopback / local
+                "localhost",
+                "127.0.0.1",
+                "::1",
+                "<local>",
+                // link-local (CIDR + wildcard)
+                "169.254.0.0/16",
+                "169.254.*",
+                // RFC1918 (CIDR + wildcard approximations)
+                "10.0.0.0/8",
+                "10.*",
+                "172.16.0.0/12",
+                "172.16.*","172.17.*","172.18.*","172.19.*","172.20.*","172.21.*","172.22.*",
+                "172.23.*","172.24.*","172.25.*","172.26.*","172.27.*","172.28.*","172.29.*",
+                "172.30.*","172.31.*",
+                "192.168.0.0/16",
+                "192.168.*",
+                // Carrier-grade NAT (approximate /10)
+                "100.64.0.0/10",
+                "100.*",
+                // Special-use / documentation / testing subnets (CIDR + wildcard)
+                "192.0.0.0/24",   "192.0.0.*",
+                "192.0.2.0/24",   "192.0.2.*",
+                "192.31.196.0/24", "192.31.196.*",
+                "192.52.193.0/24", "192.52.193.*",
+                "192.88.99.0/24",  "192.88.99.*",
+                "192.175.48.0/24", "192.175.48.*",
+                "198.18.0.0/15",   "198.18.*", "198.19.*",
+                "198.51.100.0/24", "198.51.100.*",
+                "203.0.113.0/24",  "203.0.113.*",
+                // Class E (reserved) 240.0.0.0/4 (approximate with 16 wildcards)
+                "240.0.0.0/4",
+                "240.*","241.*","242.*","243.*","244.*","245.*","246.*","247.*",
+                "248.*","249.*","250.*","251.*","252.*","253.*","254.*","255.*",
+            ].join(",")),
         }
     }
 }
@@ -144,6 +181,10 @@ impl SystemProxyManager {
         {
             self.set_windows_system_proxy(settings).await?;
         }
+        #[cfg(target_os = "macos")]
+        {
+            self.set_macos_system_proxy(settings).await?;
+        }
 
         Ok(())
     }
@@ -218,6 +259,152 @@ impl SystemProxyManager {
         unsafe {
             let _ = InternetSetOptionW(None, INTERNET_OPTION_SETTINGS_CHANGED, None, 0);
             let _ = InternetSetOptionW(None, INTERNET_OPTION_REFRESH, None, 0);
+        }
+
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn set_macos_system_proxy(&self, settings: &ProxySettings) -> Result<()> {
+        // On macOS we configure SOCKS proxy using `networksetup` for all network services
+        // We intentionally only set SOCKS to keep HTTP/HTTPS untouched
+        let services = list_macos_network_services();
+
+        // Determine host:port from provided settings (prefer SOCKS5)
+        let maybe_socks = settings
+            .socks_proxy
+            .as_ref()
+            .or(settings.http_proxy.as_ref())
+            .cloned();
+
+        if let Some(socks_url) = maybe_socks {
+            // Normalize to host, port
+            let (host, port) = parse_socks_host_port(&socks_url).unwrap_or(("127.0.0.1".to_string(), 1080u16));
+
+            for service in services {
+                // networksetup -setsocksfirewallproxy "Wi-Fi" host port
+                let _ = std::process::Command::new("networksetup")
+                    .arg("-setsocksfirewallproxy")
+                    .arg(&service)
+                    .arg(&host)
+                    .arg(port.to_string())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+
+                // Enable
+                let _ = std::process::Command::new("networksetup")
+                    .arg("-setsocksfirewallproxystate")
+                    .arg(&service)
+                    .arg("on")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+
+                // Bypass domains if provided
+                if let Some(ref bypass) = settings.no_proxy {
+                    let domains: Vec<String> = bypass
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if !domains.is_empty() {
+                        let mut cmd = std::process::Command::new("networksetup");
+                        cmd.arg("-setproxybypassdomains").arg(&service);
+                        for d in domains { cmd.arg(d); }
+                        let _ = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+                    }
+                }
+                // Point HTTP/HTTPS at local ACL HTTP proxy 127.0.0.1:8080 so browsers always hit ACL
+                let _ = std::process::Command::new("networksetup")
+                    .arg("-setwebproxy")
+                    .arg(&service)
+                    .arg("127.0.0.1")
+                    .arg("8080")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                let _ = std::process::Command::new("networksetup")
+                    .arg("-setwebproxystate")
+                    .arg(&service)
+                    .arg("on")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                let _ = std::process::Command::new("networksetup")
+                    .arg("-setsecurewebproxy")
+                    .arg(&service)
+                    .arg("127.0.0.1")
+                    .arg("8080")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                let _ = std::process::Command::new("networksetup")
+                    .arg("-setsecurewebproxystate")
+                    .arg(&service)
+                    .arg("on")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+
+            // Install a PAC file to implement CIDR-based bypass (Outline-style) and send the rest via local proxy
+            if let Some(pac_path) = write_macos_pac(&host, 0u16, port) {
+                for service in list_macos_network_services() {
+                    let _ = std::process::Command::new("networksetup")
+                        .arg("-setautoproxyurl")
+                        .arg(&service)
+                        .arg(format!("file://{}", pac_path))
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                    let _ = std::process::Command::new("networksetup")
+                        .arg("-setautoproxystate")
+                        .arg(&service)
+                        .arg("on")
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+                log::info!("[SYSTEM_PROXY][macOS] PAC installed for services");
+            } else {
+                log::warn!("[SYSTEM_PROXY][macOS] Failed to write PAC file; relying on SOCKS + domain bypass only");
+            }
+        } else {
+            // Disable SOCKS proxy on all services
+            for service in services {
+                let _ = std::process::Command::new("networksetup")
+                    .arg("-setsocksfirewallproxystate")
+                    .arg(&service)
+                    .arg("off")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                // Also disable HTTP/HTTPS
+                let _ = std::process::Command::new("networksetup")
+                    .arg("-setwebproxystate")
+                    .arg(&service)
+                    .arg("off")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                let _ = std::process::Command::new("networksetup")
+                    .arg("-setsecurewebproxystate")
+                    .arg(&service)
+                    .arg("off")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                // Disable Auto Proxy (PAC)
+                let _ = std::process::Command::new("networksetup")
+                    .arg("-setautoproxystate")
+                    .arg(&service)
+                    .arg("off")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+            log::info!("[SYSTEM_PROXY][macOS] SOCKS proxy disabled for all services");
         }
 
         Ok(())
@@ -350,6 +537,10 @@ fn set_proxy_kde(settings: &ProxySettings) -> Result<()> {
                 // http/https empty to avoid forcing
                 Command::new("kwriteconfig5").args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "httpProxy", ""]).output()?;
                 Command::new("kwriteconfig5").args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "httpsProxy", ""]).output()?;
+                // set bypass list if provided
+                if let Some(ref bypass) = settings.no_proxy {
+                    Command::new("kwriteconfig5").args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "NoProxyFor", bypass]).output()?;
+                }
                 // apply
                 let _ = Command::new("qdbus").args(["org.kde.kded5", "/kded", "reconfigure"]).stdout(Stdio::null()).stderr(Stdio::null()).output();
                 log::info!("[SYSTEM_PROXY] KDE proxy set: {}:{}", host, port);
@@ -359,6 +550,8 @@ fn set_proxy_kde(settings: &ProxySettings) -> Result<()> {
         // disable
         Command::new("kwriteconfig5").args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "ProxyType", "0"]).output()?;
         Command::new("kwriteconfig5").args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "socksProxy", ""]).output()?;
+        // clear bypass
+        Command::new("kwriteconfig5").args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "NoProxyFor", ""]).output()?;
         let _ = Command::new("qdbus").args(["org.kde.kded5", "/kded", "reconfigure"]).stdout(Stdio::null()).stderr(Stdio::null()).output();
         log::info!("[SYSTEM_PROXY] KDE proxy disabled");
     }
@@ -369,4 +562,163 @@ impl Default for SystemProxyManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[cfg(target_os = "macos")]
+fn list_macos_network_services() -> Vec<String> {
+    // Parse `networksetup -listallnetworkservices` and skip header and disabled services (prefixed with '*')
+    let output = std::process::Command::new("networksetup").arg("-listallnetworkservices").output();
+    if let Ok(out) = output {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            let mut services: Vec<String> = Vec::new();
+            for raw in text.lines() {
+                let line = raw.trim();
+                if line.is_empty() { continue; }
+                if line.starts_with("An asterisk (") { continue; }
+                // Skip disabled services (start with '* ')
+                if line.starts_with('*') { continue; }
+                services.push(line.to_string());
+            }
+            if !services.is_empty() { return services; }
+        }
+    }
+    // Fallback to common service names
+    vec!["Wi-Fi".to_string(), "Ethernet".to_string()]
+}
+
+#[cfg(target_os = "macos")]
+fn parse_socks_host_port(url: &str) -> Option<(String, u16)> {
+    // Accept formats: socks5://host:port, socks://host:port, host:port
+    let trimmed = url
+        .strip_prefix("socks5://")
+        .or_else(|| url.strip_prefix("socks://"))
+        .unwrap_or(url);
+    let (host, port_str) = trimmed.split_once(':')?;
+    let port = port_str.parse::<u16>().ok()?;
+    Some((host.to_string(), port))
+}
+
+#[cfg(target_os = "macos")]
+fn verify_macos_proxies() -> bool {
+    // scutil --proxy prints a plist-like dictionary; check that HTTP, HTTPS or SOCKS are enabled
+    if let Ok(out) = std::process::Command::new("scutil").arg("--proxy").output() {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
+            let http_on = text.contains("httpenable : 1") && text.contains("httpproxy : 127.0.0.1") && text.contains("httpport : 8080");
+            let https_on = text.contains("httpsenable : 1") && text.contains("httpsproxy : 127.0.0.1") && text.contains("httpsport : 8080");
+            let socks_on = text.contains("socksenable : 1");
+            return http_on || https_on || socks_on;
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn write_macos_pac(http_host: &str, _http_port: u16, socks_port: u16) -> Option<String> {
+    use std::fs;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    let mut dir = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    dir.push("Library");
+    dir.push("Application Support");
+    dir.push("CrabSock");
+    let _ = fs::create_dir_all(&dir);
+    let mut pac_path = PathBuf::from(&dir);
+    pac_path.push("proxy.pac");
+
+    // Collect additional IPv4 routes that are bound to utun*/pritunl interfaces to bypass via DIRECT
+    let mut dynamic_routes: Vec<(String, String)> = Vec::new();
+    if let Ok(out) = Command::new("netstat").args(["-rn", "-f", "inet"]).output() {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                // Example columns: Destination  Gateway  Flags  Refs  Use  Netif  Expire
+                // We are interested in lines where Netif starts with utun or contains 'pritunl'
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 7 {
+                    let destination = parts[0];
+                    let netif = parts[6];
+                    if netif.starts_with("utun") || netif.to_lowercase().contains("pritunl") {
+                        if destination == "default" { continue; }
+                        // destination may be in form A.B.C.D/xx or A.B.C.D
+                        if let Some((addr, prefix_str)) = destination.split_once('/') {
+                            if let Ok(prefix) = prefix_str.parse::<u8>() {
+                                // compute mask from prefix
+                                let mask_u32: u32 = if prefix == 0 { 0 } else { (!0u32) << (32 - prefix as u32) };
+                                let mask = format!("{}.{}.{}.{}",
+                                    (mask_u32 >> 24) & 0xff,
+                                    (mask_u32 >> 16) & 0xff,
+                                    (mask_u32 >> 8) & 0xff,
+                                    mask_u32 & 0xff);
+                                dynamic_routes.push((addr.to_string(), mask));
+                            }
+                        } else {
+                            // host route, use /32 mask
+                            dynamic_routes.push((destination.to_string(), "255.255.255.255".to_string()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Outline-like excluded subnets via PAC isInNet checks
+    let mut pac = format!(r#"function FindProxyForURL(url, host) {{
+  if (isPlainHostName(host) ||
+      isInNet(host, '10.0.0.0', '255.0.0.0') ||
+      isInNet(host, '100.64.0.0', '255.192.0.0') ||
+      isInNet(host, '169.254.0.0', '255.255.0.0') ||
+      isInNet(host, '172.16.0.0', '255.240.0.0') ||
+      isInNet(host, '192.0.0.0', '255.255.255.0') ||
+      isInNet(host, '192.0.2.0', '255.255.255.0') ||
+      isInNet(host, '192.31.196.0', '255.255.255.0') ||
+      isInNet(host, '192.52.193.0', '255.255.255.0') ||
+      isInNet(host, '192.88.99.0', '255.255.255.0') ||
+      isInNet(host, '192.168.0.0', '255.255.0.0') ||
+      isInNet(host, '192.175.48.0', '255.255.255.0') ||
+      isInNet(host, '198.18.0.0', '255.254.0.0') ||
+      isInNet(host, '198.51.100.0', '255.255.255.0') ||
+      isInNet(host, '203.0.113.0', '255.255.255.0') ||
+      isInNet(host, '240.0.0.0', '240.0.0.0')) {{
+    return 'DIRECT';
+  }}
+  return 'SOCKS {0}:{1}';
+}}
+"#, http_host, socks_port);
+
+    // Append dynamic routes from utun/pritunl to DIRECT checks
+    if !dynamic_routes.is_empty() {
+        let mut extra = String::new();
+        extra.push_str("// dynamic routes via utun/pritunl\nfunction __bypassDynamic(host) {\n");
+        extra.push_str("  if (\n");
+        for (i, (addr, mask)) in dynamic_routes.iter().enumerate() {
+            if i > 0 { extra.push_str("      || "); } else { extra.push_str("      "); }
+            extra.push_str(&format!("isInNet(host, '{}', '{}')\n", addr, mask));
+        }
+        extra.push_str("  ) { return 'DIRECT'; }\n  return null;\n}\n\n");
+        // Insert call to __bypassDynamic at top: we prepend function and then rewrap main with it
+        // Simple way: append a second FindProxyForURL that prioritizes dynamic bypass
+        let wrapped = format!(
+            r#"{extra}
+function FindProxyForURL(url, host) {{
+  var d = __bypassDynamic(host);
+  if (d) return d;
+  return ({main})(url, host);
+}}
+"#,
+            extra = extra,
+            main = "FindProxyForURL"
+        );
+        pac.push_str(&wrapped);
+    }
+
+    if let Ok(mut f) = fs::File::create(&pac_path) {
+        if f.write_all(pac.as_bytes()).is_ok() {
+            return Some(pac_path.to_string_lossy().into_owned());
+        }
+    }
+    None
 }
