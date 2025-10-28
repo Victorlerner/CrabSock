@@ -1,5 +1,9 @@
 use anyhow::Result;
 use std::process::{Command, Stdio};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000; // WinAPI CREATE_NO_WINDOW
 
 #[cfg(target_os = "windows")]
 fn current_exe() -> String {
@@ -12,6 +16,7 @@ fn current_exe() -> String {
 fn run_elevated_ps_script(script: &str) -> Result<()> {
     // Elevate one PowerShell process and run the combined script (single UAC prompt)
     let status = Command::new("powershell")
+        .creation_flags(CREATE_NO_WINDOW)
         .args([
             "-NoProfile",
             "-WindowStyle", "Hidden",
@@ -62,6 +67,7 @@ pub fn ensure_firewall_rules_allow() -> Result<()> { Ok(()) }
 fn firewall_rules_exist() -> Result<bool> {
     // Check both rules; if both present, return true
     let has_out = Command::new("netsh")
+        .creation_flags(CREATE_NO_WINDOW)
         .args(["advfirewall", "firewall", "show", "rule", "name=CrabSock_Out"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -69,6 +75,7 @@ fn firewall_rules_exist() -> Result<bool> {
         .map(|s| s.success())
         .unwrap_or(false);
     let has_in = Command::new("netsh")
+        .creation_flags(CREATE_NO_WINDOW)
         .args(["advfirewall", "firewall", "show", "rule", "name=CrabSock_In_1080"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
