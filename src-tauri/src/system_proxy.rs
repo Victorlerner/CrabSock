@@ -6,6 +6,10 @@ use std::process::Stdio;
 use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 #[cfg(target_os = "windows")]
 use windows::Win32::Networking::WinInet::{InternetSetOptionW, INTERNET_OPTION_SETTINGS_CHANGED, INTERNET_OPTION_REFRESH};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000; // WinAPI CREATE_NO_WINDOW
 
 #[derive(Debug, Clone)]
 pub struct ProxySettings {
@@ -301,7 +305,13 @@ impl SystemProxyManager {
               }
             } catch {}
         "#;
-        if let Ok(out) = Command::new("powershell").args(["-NoProfile", "-Command", ps]).output() {
+        if let Ok(out) = Command::new("powershell")
+            .args(["-NoProfile", "-Command", ps])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output() {
             if out.status.success() {
                 let text = String::from_utf8_lossy(&out.stdout);
                 for line in text.lines() {

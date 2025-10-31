@@ -1,6 +1,6 @@
 use crate::config::ProxyConfig;
 use crate::proxy::{ProxyManager, ConnectionStatus};
-use crate::config_manager::{ConfigManager, ConfigFile};
+use crate::config_manager::{ConfigManager, ConfigFile, AppSettings, RoutingMode};
 use crate::system_proxy::{SystemProxyManager, ProxySettings};
 use crate::tun_manager::TunManager;
 use crate::linux_capabilities::has_cap_net_admin;
@@ -10,6 +10,8 @@ use once_cell::sync::Lazy;
 use tokio::sync::Mutex;
 use serde::Serialize;
 use tauri::Emitter;
+#[cfg(target_os = "windows")]
+use std::process::Stdio;
 
 static PROXY_MANAGER: Lazy<Mutex<ProxyManager>> = Lazy::new(|| Mutex::new(ProxyManager::new()));
 static SYSTEM_PROXY_MANAGER: Lazy<Mutex<SystemProxyManager>> = Lazy::new(|| Mutex::new(SystemProxyManager::new()));
@@ -58,6 +60,67 @@ pub async fn parse_proxy_config(config_string: String) -> Result<ProxyConfig, St
 }
 
 #[tauri::command]
+pub async fn ensure_admin_for_tun() -> Result<bool, String> {
+    #[cfg(target_os = "windows")]
+    {
+        if is_elevated_windows() { return Ok(true); }
+        // Try to relaunch elevated via PowerShell (UAC prompt)
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let exe_str = exe.to_string_lossy().replace('"', "\"");
+        let ps = format!(
+            "Start-Process -FilePath \"{}\" -Verb RunAs -ArgumentList '--set-routing=tun'",
+            exe_str
+        );
+        let status = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &ps])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| e.to_string())?;
+        if status.success() {
+            // Advise frontend to let this instance exit; elevated one will start
+            Ok(false)
+        } else {
+            Err("Failed to trigger elevation".into())
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(true)
+    }
+}
+
+#[tauri::command]
+pub async fn exit_app(app: tauri::AppHandle) -> Result<(), String> {
+    let _ = app.exit(0);
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn is_elevated_windows() -> bool {
+    // Use PowerShell to check admin group membership to avoid Win32 FFI
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)"
+        ])
+        .stdin(Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    if let Ok(o) = out {
+        if o.status.success() {
+            let s = String::from_utf8_lossy(&o.stdout).to_ascii_lowercase();
+            return s.contains("true");
+        }
+    }
+    false
+}
+
+#[tauri::command]
 pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(), String> {
     // Log masked config to avoid leaking secrets
     log::info!("[CONNECT] Starting VPN connection with config: {:?}", config.masked());
@@ -70,6 +133,12 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
     match result {
         Ok(_) => {
             log::info!("[CONNECT] VPN proxy started successfully");
+            // Export remote server host/port for TUN route exclusions (Windows)
+            #[cfg(target_os = "windows")]
+            {
+                std::env::set_var("SS_REMOTE_HOST", config.server.clone());
+                std::env::set_var("SS_REMOTE_PORT", config.port.to_string());
+            }
             // On Windows, proactively allow app in firewall (single prompt, cached by checking existing rules)
             #[cfg(target_os = "windows")]
             if let Err(e) = ensure_firewall_rules_allow() { log::warn!("[CONNECT][WIN] firewall allow failed: {}", e); }
@@ -114,9 +183,32 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                         Err(e) => println!("[STDOUT] Failed to send ip_verified event: {:?}", e),
                     }
                     
-                    // Автоматически включаем TUN после успешного подключения
-                    if let Err(e) = enable_tun_mode().await {
-                        log::warn!("[CONNECT] Failed to enable TUN mode automatically: {}", e);
+                    // Применяем режим маршрутизации из настроек (по умолчанию SystemProxy)
+                    let settings = ConfigManager::new()
+                        .map_err(|e| e.to_string())?
+                        .load_configs().await
+                        .map_err(|e| e.to_string())?
+                        .settings;
+                    match settings.routing_mode {
+                        RoutingMode::Tun => {
+                            log::info!("[ROUTING] Applying routing mode: TUN");
+                            println!("[STDOUT] ROUTING: Applying mode TUN");
+                            // Clear system proxy on all platforms when switching to TUN
+                            let _ = clear_system_proxy().await;
+                            if let Err(e) = enable_tun_mode().await { log::warn!("[CONNECT] Failed to enable TUN mode automatically: {}", e); }
+                        }
+                        RoutingMode::SystemProxy => {
+                            log::info!("[ROUTING] Applying routing mode: SystemProxy");
+                            println!("[STDOUT] ROUTING: Applying mode SystemProxy");
+                            // Ensure TUN is disabled if it was on
+                            let _ = disable_tun_mode().await;
+                            // Устанавливаем системный прокси на наш локальный SOCKS5
+                            let proxy_settings = ProxySettings::with_socks5("127.0.0.1", 1080);
+                            let mut system_manager = SYSTEM_PROXY_MANAGER.lock().await;
+                            if let Err(e) = system_manager.set_system_proxy(&proxy_settings).await {
+                                log::warn!("[CONNECT] Failed to set system proxy automatically: {}", e);
+                            }
+                        }
                     }
 
                     log::info!("[CONNECT] VPN connected and verified successfully");
@@ -170,8 +262,22 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                                     manager.mark_connected().await;
                                 }
                                 let _ = window.emit("ip_verified", ip_info);
-                                if let Err(e) = enable_tun_mode().await {
-                                    log::warn!("[CONNECT] Failed to enable TUN mode automatically: {}", e);
+                                let settings = ConfigManager::new().map_err(|e| e.to_string())?.load_configs().await.map_err(|e| e.to_string())?.settings;
+                                match settings.routing_mode {
+                                    RoutingMode::Tun => {
+                                        log::info!("[ROUTING] Applying routing mode: TUN");
+                                        println!("[STDOUT] ROUTING: Applying mode TUN");
+                                        let _ = clear_system_proxy().await;
+                                        if let Err(e) = enable_tun_mode().await { log::warn!("[CONNECT] Failed to enable TUN mode automatically: {}", e); }
+                                    }
+                                    RoutingMode::SystemProxy => {
+                                        log::info!("[ROUTING] Applying routing mode: SystemProxy");
+                                        println!("[STDOUT] ROUTING: Applying mode SystemProxy");
+                                        let _ = disable_tun_mode().await;
+                                        let proxy_settings = ProxySettings::with_socks5("127.0.0.1", 1080);
+                                        let mut system_manager = SYSTEM_PROXY_MANAGER.lock().await;
+                                        let _ = system_manager.set_system_proxy(&proxy_settings).await;
+                                    }
                                 }
                                 Ok(())
                             }
@@ -323,11 +429,17 @@ pub async fn start_connection_monitoring(window: tauri::Window) -> Result<(), St
 pub async fn get_ip() -> Result<IpInfo, String> {
     log::info!("[IP] Fetching external IP");
 
-    // Определяем текущий статус. Если Connected или Connecting — используем локальный SOCKS5, иначе ходим напрямую.
+    // Определяем текущий статус и режим маршрутизации, чтобы понять, использовать ли локальный SOCKS
     let status = {
         let manager = PROXY_MANAGER.lock().await;
         manager.get_status().await
     };
+    let routing_mode = ConfigManager::new()
+        .map_err(|e| e.to_string())?
+        .load_configs().await
+        .map_err(|e| e.to_string())?
+        .settings
+        .routing_mode;
 
     let client_builder = reqwest::Client::builder()
         .pool_idle_timeout(std::time::Duration::from_secs(10))
@@ -336,15 +448,16 @@ pub async fn get_ip() -> Result<IpInfo, String> {
         .timeout(std::time::Duration::from_secs(12))
         .no_proxy();
 
-    let client = if matches!(status, ConnectionStatus::Connected | ConnectionStatus::Connecting) {
-        // Используем SOCKS из env если задан, иначе стандартный локальный порт
+    // Если SystemProxy — проверяем через локальный SOCKS, иначе (Tun/другое) — без прокси
+    let use_socks = matches!(status, ConnectionStatus::Connected | ConnectionStatus::Connecting)
+        && matches!(routing_mode, RoutingMode::SystemProxy);
+    let client = if use_socks {
         let proxy_url = std::env::var("SOCKS_PROXY").unwrap_or_else(|_| "socks5h://127.0.0.1:1080".to_string());
         client_builder
             .proxy(reqwest::Proxy::all(&proxy_url).map_err(|e| format!("Failed to create SOCKS5 proxy: {}", e))?)
             .build()
             .map_err(|e| format!("Failed to create proxied HTTP client: {}", e))?
     } else {
-        // Без прокси, чтобы получить реальный внешний IP пользователя
         client_builder
             .build()
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?
@@ -500,6 +613,53 @@ pub async fn save_config(config: ProxyConfig) -> Result<(), String> {
     Ok(())
 }
 
+// App settings
+#[tauri::command]
+pub async fn get_settings() -> Result<AppSettings, String> {
+    let manager = ConfigManager::new().map_err(|e| e.to_string())?;
+    let file = manager.load_configs().await.map_err(|e| e.to_string())?;
+    Ok(file.settings)
+}
+
+#[tauri::command]
+pub async fn set_routing_mode(mode: String) -> Result<(), String> {
+    let manager = ConfigManager::new().map_err(|e| e.to_string())?;
+    let mut file = manager.load_configs().await.map_err(|e| e.to_string())?;
+    let new_mode = match mode.to_lowercase().as_str() { "tun" => RoutingMode::Tun, _ => RoutingMode::SystemProxy };
+    let old_mode = file.settings.routing_mode.clone();
+
+    if old_mode != new_mode { log::info!("[ROUTING] Switching routing mode: {:?} -> {:?}", old_mode, new_mode); println!("[STDOUT] ROUTING: switch {:?} -> {:?}", old_mode, new_mode); }
+
+    file.settings.routing_mode = new_mode.clone();
+    manager.save_configs(&file).await.map_err(|e| e.to_string())?;
+
+    // Live-apply when connected
+    let status = {
+        let proxy_manager = PROXY_MANAGER.lock().await;
+        proxy_manager.get_status().await
+    };
+    if matches!(status, ConnectionStatus::Connected) {
+        match new_mode {
+            RoutingMode::Tun => {
+                // Switch to TUN: always clear system proxy so kernel routing dominates
+                log::info!("[ROUTING] Live-apply: enabling TUN (clearing system proxy)");
+                let _ = clear_system_proxy().await; // ignore errors
+                if let Err(e) = enable_tun_mode().await { log::warn!("[ROUTING] Live-apply TUN failed: {}", e); }
+            }
+            RoutingMode::SystemProxy => {
+                // Switch to System Proxy: disable TUN, set proxy
+                log::info!("[ROUTING] Live-apply: enabling System Proxy (disabling TUN)");
+                let _ = disable_tun_mode().await;
+                let proxy_settings = ProxySettings::with_socks5("127.0.0.1", 1080);
+                let mut system_manager = SYSTEM_PROXY_MANAGER.lock().await;
+                if let Err(e) = system_manager.set_system_proxy(&proxy_settings).await { log::warn!("[ROUTING] Live-apply System Proxy failed: {}", e); }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn remove_config(config: ProxyConfig) -> Result<(), String> {
     log::info!("[CONFIG] Removing config: {}", config.name);
@@ -606,13 +766,16 @@ pub async fn enable_tun_mode() -> Result<(), String> {
                 Ok(_) => {
                     println!("[STDOUT] TUN interface started successfully");
 
-                    // Включаем TUN режим в системном прокси менеджере
-                    let mut system_manager = SYSTEM_PROXY_MANAGER.lock().await;
-                    system_manager.set_tun_mode(true).await
-                        .map_err(|e| {
-                            println!("[STDOUT] Failed to enable TUN mode: {}", e);
-                            format!("Failed to enable TUN mode: {}", e)
-                        })?;
+                    // В TUN режиме на Windows системный прокси не включаем
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        let mut system_manager = SYSTEM_PROXY_MANAGER.lock().await;
+                        system_manager.set_tun_mode(true).await
+                            .map_err(|e| {
+                                println!("[STDOUT] Failed to enable TUN mode: {}", e);
+                                format!("Failed to enable TUN mode: {}", e)
+                            })?;
+                    }
                     
                     println!("[STDOUT] TUN mode enabled successfully - all traffic routed through VPN");
                     log::info!("[TUN] TUN mode enabled successfully");

@@ -61,6 +61,7 @@ export const useVpnStore = defineStore('vpn', {
       tun_mode: false,
     },
     configPath: '',
+    routingMode: 'systemproxy' as 'systemproxy' | 'tun',
   }),
   actions: {
     addLog(level: 'info' | 'warn' | 'error', message: string, source: 'frontend' | 'backend' = 'frontend') {
@@ -99,6 +100,15 @@ export const useVpnStore = defineStore('vpn', {
         this.addLog('info', `Config path: ${this.configPath}`, 'frontend')
       } catch (e) {
         this.addLog('error', `Failed to load configs: ${e}`, 'frontend')
+      }
+
+      // Load routing mode from backend settings
+      try {
+        const settings = await invoke('get_settings') as { routing_mode?: string }
+        const mode = (settings?.routing_mode || 'SystemProxy').toString().toLowerCase()
+        this.routingMode = mode === 'tun' ? 'tun' : 'systemproxy'
+      } catch (e) {
+        // ignore, keep default
       }
 
       // Listen for backend status events
@@ -182,7 +192,17 @@ export const useVpnStore = defineStore('vpn', {
         this.addLog('error', `Failed to save settings: ${e}`, 'frontend')
       })
     },
-    
+
+    async setRoutingMode(mode: 'systemproxy' | 'tun') {
+      try {
+        await invoke('set_routing_mode', { mode })
+        this.routingMode = mode
+        this.addLog('info', `Routing mode set to ${mode}`, 'frontend')
+      } catch (e) {
+        this.addLog('error', `Failed to set routing mode: ${e}`, 'frontend')
+      }
+    },
+
     async applyConfig() {
       if (!this.rawConfig.trim()) {
         this.setError('Config cannot be empty')
