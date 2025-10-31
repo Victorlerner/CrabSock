@@ -154,6 +154,14 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                         if let Some(sid) = &config.reality_short_id { std::env::set_var("SB_VLESS_SID", sid); }
                         if let Some(spx) = &config.reality_spx { std::env::set_var("SB_VLESS_SPX", spx); }
                     }
+                    crate::config::ProxyType::Shadowsocks => {
+                        // For TUN use sing-box outbound=shadowsocks directly to upstream
+                        std::env::set_var("SB_OUTBOUND_TYPE", "shadowsocks");
+                        std::env::set_var("SB_SS_SERVER", &config.server);
+                        std::env::set_var("SB_SS_PORT", config.port.to_string());
+                        if let Some(method) = &config.method { std::env::set_var("SB_SS_METHOD", method); }
+                        if let Some(password) = &config.password { std::env::set_var("SB_SS_PASSWORD", password); }
+                    }
                     _ => {
                         std::env::set_var("SB_OUTBOUND_TYPE", "socks");
                     }

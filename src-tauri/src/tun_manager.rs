@@ -677,6 +677,22 @@ fn build_singbox_config(cfg: &TunConfig, socks_host: String, socks_port: u16) ->
             },
             { "type": "direct", "tag": "direct" }
         ])
+    } else if outbound_type == "shadowsocks" {
+        let server = std::env::var("SB_SS_SERVER").unwrap_or_else(|_| "".into());
+        let port: u16 = std::env::var("SB_SS_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8388);
+        let method = std::env::var("SB_SS_METHOD").unwrap_or_else(|_| "chacha20-ietf-poly1305".into());
+        let password = std::env::var("SB_SS_PASSWORD").unwrap_or_else(|_| "".into());
+        json!([
+            {
+                "type": "shadowsocks",
+                "tag": "proxy",
+                "server": server,
+                "server_port": port,
+                "method": method,
+                "password": password
+            },
+            { "type": "direct", "tag": "direct" }
+        ])
     } else {
         json!([
             {
