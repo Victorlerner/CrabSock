@@ -97,6 +97,25 @@ fn main() {
         }
     });
 
+    // Handle Ctrl+C / console close to gracefully tear down external processes
+    {
+        let _ = ctrlc::set_handler(|| {
+            // Fire-and-forget: best effort cleanup
+            std::thread::spawn(|| {
+                if let Ok(rt) = tokio::runtime::Runtime::new() {
+                    rt.block_on(async {
+                        crab_sock::commands::disconnect_vpn_silent().await;
+                        let _ = crab_sock::commands::disable_tun_mode().await;
+                        let _ = crab_sock::commands::clear_system_proxy().await;
+                    });
+                }
+                // Give the OS a moment to release file handles
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                std::process::exit(0);
+            });
+        });
+    }
+
     tauri::Builder::default()
         .setup(|app| {
             // Создаем трей-иконку и обрабатываем клики для показа окна
@@ -135,9 +154,12 @@ fn main() {
                             }
                         }
                         "quit" => {
-                            // Грейсфул-шатдаун: отключаем TUN и чистим системный прокси перед выходом
+                            // Грейсфул-шатдаун: сначала останавливаем прокси (убьёт sing-box), затем TUN и системный прокси
                             let app = icon.app_handle().clone();
                             tauri::async_runtime::spawn(async move {
+                                // Stop proxy first (kills sing-box if running)
+                                disconnect_vpn_silent().await;
+                                // Then tear down TUN and system proxy
                                 let _ = disable_tun_mode().await;
                                 let _ = clear_system_proxy().await;
                                 let _ = app.exit(0);

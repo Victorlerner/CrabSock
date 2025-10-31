@@ -136,8 +136,28 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
             // Export remote server host/port for TUN route exclusions (Windows)
             #[cfg(target_os = "windows")]
             {
+                // Common route exclusion (for any upstream)
                 std::env::set_var("SS_REMOTE_HOST", config.server.clone());
                 std::env::set_var("SS_REMOTE_PORT", config.port.to_string());
+                // Export outbound params for sing-box TUN integration
+                match config.proxy_type {
+                    crate::config::ProxyType::VLESS => {
+                        std::env::set_var("SB_OUTBOUND_TYPE", "vless");
+                        std::env::set_var("SB_VLESS_SERVER", &config.server);
+                        std::env::set_var("SB_VLESS_PORT", config.port.to_string());
+                        if let Some(uuid) = &config.uuid { std::env::set_var("SB_VLESS_UUID", uuid); }
+                        if let Some(security) = &config.security { std::env::set_var("SB_VLESS_SECURITY", security); }
+                        if let Some(sni) = &config.sni { std::env::set_var("SB_VLESS_SNI", sni); }
+                        if let Some(fp) = &config.fingerprint { std::env::set_var("SB_VLESS_FP", fp); }
+                        if let Some(flow) = &config.flow { std::env::set_var("SB_VLESS_FLOW", flow); }
+                        if let Some(pbk) = &config.reality_public_key { std::env::set_var("SB_VLESS_PBK", pbk); }
+                        if let Some(sid) = &config.reality_short_id { std::env::set_var("SB_VLESS_SID", sid); }
+                        if let Some(spx) = &config.reality_spx { std::env::set_var("SB_VLESS_SPX", spx); }
+                    }
+                    _ => {
+                        std::env::set_var("SB_OUTBOUND_TYPE", "socks");
+                    }
+                }
             }
             // On Windows, proactively allow app in firewall (single prompt, cached by checking existing rules)
             #[cfg(target_os = "windows")]
@@ -340,6 +360,12 @@ pub async fn disconnect_vpn(window: tauri::Window) -> Result<(), String> {
             Err(e.to_string())
         }
     }
+}
+
+// Internal helper for shutdown paths where we don't need to emit window events
+pub async fn disconnect_vpn_silent() {
+    let manager = PROXY_MANAGER.lock().await;
+    let _ = manager.disconnect().await;
 }
 
 #[tauri::command]

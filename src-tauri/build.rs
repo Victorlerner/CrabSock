@@ -45,6 +45,21 @@ fn main() {
             let _ = fs::copy(&src, bin_dir.join("wintun.dll"));
         }
 
+        // Copy sing-box.exe next to resources for dev/runtime discovery and include in bundle resources
+        let sing_src = manifest_dir
+            .join("resources")
+            .join("sing-box")
+            .join("sing-box.exe");
+        if sing_src.exists() {
+            let sing_dst_dir = target_dir.join(&profile).join("resources").join("sing-box");
+            let _ = fs::create_dir_all(&sing_dst_dir);
+            let _ = fs::copy(&sing_src, sing_dst_dir.join("sing-box.exe"));
+            // optional: also place in bin for direct lookup
+            let bin_dir = target_dir.join(&profile).join("bin");
+            let _ = fs::create_dir_all(&bin_dir);
+            let _ = fs::copy(&sing_src, bin_dir.join("sing-box.exe"));
+        }
+
         // Embed Windows manifest to request administrator privileges (UAC) via .rc
         println!("cargo:rerun-if-changed=resources/windows_manifest.rc");
         embed_resource::compile("resources/windows_manifest.rc", embed_resource::NONE);

@@ -20,6 +20,12 @@ interface ParsedConfig {
   alpn?: string[]
   ws_path?: string
   ws_headers?: Record<string, string>
+  // VLESS / REALITY extras
+  flow?: string
+  fingerprint?: string // fp
+  reality_public_key?: string // pbk
+  reality_short_id?: string // sid
+  reality_spx?: string // spx
 }
 
 interface LogEntry {
@@ -401,6 +407,33 @@ export const useVpnStore = defineStore('vpn', {
         }
         const encoded = btoa(JSON.stringify(vmessConfig))
         return `vmess://${encoded}`
+      } else if (config.proxy_type === 'VLESS') {
+        const uuid = config.uuid || ''
+        const qs = new URLSearchParams()
+        // VLESS requires encryption=none when using TLS/WS
+        qs.set('encryption', 'none')
+        if (config.security === 'reality') {
+          qs.set('security', 'reality')
+          if (config.reality_public_key) qs.set('pbk', config.reality_public_key)
+          if (config.reality_short_id) qs.set('sid', config.reality_short_id)
+          if (config.reality_spx) qs.set('spx', config.reality_spx)
+          if (config.fingerprint) qs.set('fp', config.fingerprint)
+          if (config.flow) qs.set('flow', config.flow)
+        } else if (config.tls) {
+          qs.set('security', 'tls')
+        }
+        if (config.sni) qs.set('sni', config.sni)
+        if (config.alpn && config.alpn.length) qs.set('alpn', config.alpn.join(','))
+        const net = config.network || 'tcp'
+        qs.set('type', net)
+        if (net === 'ws') {
+          if (config.ws_path) qs.set('path', config.ws_path)
+          const hostHeader = config.ws_headers?.Host || config.sni
+          if (hostHeader) qs.set('host', hostHeader)
+        }
+        if (config.skip_cert_verify) qs.set('allowInsecure', '1')
+        const tag = encodeURIComponent(config.name || `${config.server}:${config.port}`)
+        return `vless://${uuid}@${config.server}:${config.port}?${qs.toString()}#${tag}`
       }
       return JSON.stringify(config)
     },

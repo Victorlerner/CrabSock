@@ -46,6 +46,12 @@ pub struct ProxyConfig {
     pub alpn: Option<Vec<String>>,
     pub ws_path: Option<String>,
     pub ws_headers: Option<std::collections::HashMap<String, String>>,
+    // VLESS / REALITY specific
+    pub flow: Option<String>,
+    pub fingerprint: Option<String>, // fp
+    pub reality_public_key: Option<String>, // pbk
+    pub reality_short_id: Option<String>,   // sid
+    pub reality_spx: Option<String>,        // spx
 }
 
 impl ProxyConfig {
@@ -115,6 +121,11 @@ impl ProxyConfig {
             alpn: None,
             ws_path: None,
             ws_headers: None,
+            flow: None,
+            fingerprint: None,
+            reality_public_key: None,
+            reality_short_id: None,
+            reality_spx: None,
         })
     }
 
@@ -164,6 +175,11 @@ impl ProxyConfig {
             alpn: None,
             ws_path,
             ws_headers: None,
+            flow: None,
+            fingerprint: None,
+            reality_public_key: None,
+            reality_short_id: None,
+            reality_spx: None,
         })
     }
 
@@ -178,11 +194,91 @@ impl ProxyConfig {
             Self::from_ss_url(config_string)
         } else if config_string.starts_with("vmess://") {
             Self::from_vmess_url(config_string)
+        } else if config_string.starts_with("vless://") {
+            Self::from_vless_url(config_string)
         } else if config_string.starts_with('{') {
             Self::from_json(config_string)
         } else {
             Err(VpnError::InvalidConfig("Config must be URL or JSON format".to_string()))
         }
+    }
+}
+
+impl ProxyConfig {
+    pub fn from_vless_url(url: &str) -> VpnResult<Self> {
+        if !url.starts_with("vless://") {
+            return Err(VpnError::InvalidConfig("Not a VLESS URL".to_string()));
+        }
+
+        let url_obj = url::Url::parse(url)
+            .map_err(|_| VpnError::InvalidConfig("Invalid VLESS URL format".to_string()))?;
+
+        let server = url_obj.host_str()
+            .ok_or_else(|| VpnError::InvalidConfig("Missing server in VLESS URL".to_string()))?
+            .to_string();
+
+        let port = url_obj.port()
+            .ok_or_else(|| VpnError::InvalidConfig("Missing port in VLESS URL".to_string()))?;
+
+        let uuid = url_obj.username().to_string();
+        if uuid.is_empty() {
+            return Err(VpnError::InvalidConfig("Missing UUID in VLESS URL".to_string()));
+        }
+
+        let qp = url_obj.query_pairs().into_owned().collect::<std::collections::HashMap<String, String>>();
+        let security = qp.get("security").cloned().unwrap_or_else(|| "none".to_string());
+        let tls_enabled = matches!(security.as_str(), "tls" | "reality");
+        let sni = qp.get("sni").cloned().or_else(|| qp.get("host").cloned());
+        let alpn = qp.get("alpn").map(|s| s.split(',').map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).collect::<Vec<_>>() );
+        let network = qp.get("type").cloned().unwrap_or_else(|| "tcp".to_string());
+        let ws_path = qp.get("path").cloned();
+        let host_header = qp.get("host").cloned();
+        let flow = qp.get("flow").cloned();
+        let fingerprint = qp.get("fp").cloned();
+        let reality_public_key = qp.get("pbk").cloned();
+        let reality_short_id = qp.get("sid").cloned();
+        let reality_spx = qp.get("spx").cloned();
+        let skip_cert_verify = match qp.get("allowInsecure").or_else(|| qp.get("insecure")) {
+            Some(v) if v == "1" || v.eq_ignore_ascii_case("true") => Some(true),
+            Some(v) if v == "0" || v.eq_ignore_ascii_case("false") => Some(false),
+            _ => Some(false),
+        };
+
+        let mut ws_headers: Option<std::collections::HashMap<String, String>> = None;
+        if let Some(h) = host_header {
+            let mut map = std::collections::HashMap::new();
+            map.insert("Host".to_string(), h);
+            ws_headers = Some(map);
+        }
+
+        // Friendly name: prefer fragment if present
+        let name = url_obj.fragment()
+            .map(|f| urlencoding::decode(f).unwrap_or_else(|_| f.into()).to_string())
+            .unwrap_or_else(|| format!("{}:{}", server, port));
+
+        Ok(ProxyConfig {
+            proxy_type: ProxyType::VLESS,
+            name,
+            server,
+            port,
+            // Для унификации: используем UUID как пароль-плейсхолдер (многие конвейеры ожидают non-null)
+            password: Some(uuid.clone()),
+            method: None,
+            uuid: Some(uuid),
+            security: Some(security),
+            network: Some(network),
+            tls: Some(tls_enabled),
+            sni,
+            skip_cert_verify,
+            alpn,
+            ws_path,
+            ws_headers,
+            flow,
+            fingerprint,
+            reality_public_key,
+            reality_short_id,
+            reality_spx,
+        })
     }
 }
 

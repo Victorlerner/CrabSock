@@ -11,7 +11,7 @@ use {
 };
 
 #[cfg(target_os = "windows")]
-use futures_util::{SinkExt, StreamExt};
+use std::path::PathBuf;
 
 #[cfg(target_os = "linux")]
 use crate::linux_capabilities::has_cap_net_admin;
@@ -150,32 +150,31 @@ impl TunManager {
 
 #[cfg(target_os = "windows")]
 pub struct TunManager {
-    dev: Option<tun::AsyncDevice>,
-    bridge_tasks: Vec<tokio::task::JoinHandle<()>>,
+    singbox_child: Option<tokio::process::Child>,
+    temp_config: Option<PathBuf>,
     config: TunConfig,
     is_running: bool,
 }
 
 #[cfg(target_os = "windows")]
 impl TunManager {
-    pub fn new() -> Self { Self { dev: None, bridge_tasks: Vec::new(), config: TunConfig::default(), is_running: false } }
+    pub fn new() -> Self { Self { singbox_child: None, temp_config: None, config: TunConfig::default(), is_running: false } }
 
     pub async fn start(&mut self) -> Result<()> {
         if self.is_running { return Ok(()); }
-        log::info!("[TUN][WIN] Starting Wintun + tun2socks (TCP via SOCKS5)");
+        log::info!("[TUN][WIN] Starting sing-box (TUN inbound -> local SOCKS5)");
 
-        // Ensure signed wintun.dll is discoverable by the loader
+        // Determine outbound type from environment (default socks)
+        let outbound_type = std::env::var("SB_OUTBOUND_TYPE").unwrap_or_else(|_| "socks".to_string());
+        let (socks_host, socks_port) = get_socks_endpoint();
+        if outbound_type == "socks" { ensure_socks_ready(&socks_host, socks_port).await?; }
+
+        // Ensure wintun.dll is on PATH (sing-box loads it)
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
                 let exe_dir = dir.to_path_buf();
                 let arch = std::env::consts::ARCH;
-                let win_folder = match arch {
-                    "x86_64" => "amd64",
-                    "aarch64" => "arm64",
-                    "x86" => "x86",
-                    "arm" => "arm",
-                    _ => "amd64",
-                };
+                let win_folder = match arch { "x86_64" => "amd64", "aarch64" => "arm64", "x86" => "x86", "arm" => "arm", _ => "amd64" };
                 let candidates = [
                     exe_dir.join("wintun.dll"),
                     exe_dir.join("bin").join("wintun.dll"),
@@ -183,14 +182,10 @@ impl TunManager {
                     exe_dir.join("resources").join("bin").join("wintun.dll"),
                     exe_dir.join("resources").join("wintun").join("bin").join(win_folder).join("wintun.dll"),
                 ];
-                let present = candidates.iter().find(|p| p.exists()).cloned();
-                if let Some(src) = present {
+                if let Some(src) = candidates.iter().find(|p| p.exists()).cloned() {
                     let target = exe_dir.join("wintun.dll");
-                    if src != target && !target.exists() {
-                        let _ = std::fs::copy(&src, &target);
-                    }
+                    if src != target && !target.exists() { let _ = std::fs::copy(&src, &target); }
                 }
-                // Prepend exe dir to PATH so LoadLibrary can resolve wintun.dll
                 use std::ffi::OsString;
                 let mut new_path = OsString::new();
                 new_path.push(exe_dir.as_os_str());
@@ -199,157 +194,69 @@ impl TunManager {
             }
         }
 
-        // Create (or open) a Wintun device
-        // Force MTU to 1400 to avoid fragmentation issues on common paths
-        let mut cfg = tun::Configuration::default();
-        cfg.tun_name(&self.config.name).mtu(1400).up();
-        let dev = tun::create_as_async(&cfg)
-            .map_err(|e| anyhow::anyhow!("Failed to create Wintun: {}", e))?;
+        // Resolve sing-box path
+        let singbox_path = find_singbox_path().ok_or_else(|| anyhow::anyhow!("sing-box.exe not found in resources or alongside executable"))?;
 
-        // Configure IP and split routes through PowerShell (fail fast on errors)
-        self.configure_ip_windows()?;
-        self.clear_routes_windows()?;
-        self.configure_routes_windows()?;
-
-        // Build a lwIP netstack and bridge it to the TUN device
-        // Use larger buffers to reduce backpressure and drops under load
-        let (stack, mut tcp_listener, udp_socket) = netstack_lwip::NetStack::with_buffer_size(65536, 8192)?;
-
-        let framed = dev.into_framed();
-        let (mut tun_sink, mut tun_stream) = framed.split();
-        let (mut stack_sink, mut stack_stream) = stack.split();
-
-        // Stack -> TUN
-        self.bridge_tasks.push(tokio::spawn(async move {
-            while let Some(pkt) = stack_stream.next().await {
-                match pkt {
-                    Ok(pkt) => { if let Err(e) = tun_sink.send(pkt).await { log::error!("[TUN][WIN] send to TUN failed: {}", e); break; } }
-                    Err(e) => { log::error!("[TUN][WIN] netstack stream error: {}", e); break; }
-                }
+        // Build sing-box configuration
+        let cfg_path = build_singbox_config(&self.config, socks_host, socks_port)?;
+        if std::env::var("LOG_SINGBOX_CONFIG").ok().as_deref() != Some("0") {
+            if let Ok(cfg_text) = std::fs::read_to_string(&cfg_path) {
+                log::info!("[SING-BOX][CONFIG] {}", cfg_text);
             }
-        }));
+        }
+        self.temp_config = Some(cfg_path.clone());
 
-        // TUN -> Stack
-        self.bridge_tasks.push(tokio::spawn(async move {
-            while let Some(pkt) = tun_stream.next().await {
-                match pkt {
-                    Ok(pkt) => { if let Err(e) = stack_sink.send(pkt).await { log::error!("[TUN][WIN] send to stack failed: {}", e); break; } }
-                    Err(e) => { log::error!("[TUN][WIN] TUN read error: {}", e); break; }
+        // Spawn sing-box
+        use tokio::process::Command;
+        use std::process::Stdio;
+        #[allow(unused_imports)]
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        // TODO: Remove ENABLE_DEPRECATED_SPECIAL_OUTBOUNDS when sing-box 1.12.0 is released
+        let mut child = Command::new(&singbox_path)
+            .creation_flags(CREATE_NO_WINDOW)
+            .args(["run", "-c", cfg_path.to_string_lossy().as_ref(), "--disable-color"]) 
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!(format!("Failed to start sing-box: {}", e)))?;
+
+        // Pipe sing-box logs to our logger
+        if let Some(stdout) = child.stdout.take() {
+            tokio::spawn(async move {
+                use tokio::io::{AsyncBufReadExt, BufReader};
+                let mut r = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = r.next_line().await {
+                    if !line.trim().is_empty() { log::info!("[SING-BOX][STDOUT] {}", line); }
                 }
-            }
-        }));
-
-        // TCP sockets from netstack -> local SOCKS5 (queue instead of dropping when saturated)
-        let max_concurrency: usize = std::env::var("TUN_TCP_CONCURRENCY").ok().and_then(|s| s.parse().ok()).unwrap_or(16384);
-        let tcp_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(max_concurrency));
-        let (socks_host, socks_port) = get_socks_endpoint();
-        log::info!("[TUN][WIN] Using SOCKS endpoint {}:{}", socks_host, socks_port);
-        // Ensure local SOCKS (Shadowsocks) is up before proceeding
-        ensure_socks_ready(&socks_host, socks_port).await?;
-        self.bridge_tasks.push(tokio::spawn({
-            let tcp_sem = tcp_sem.clone();
-            let socks_host = socks_host.clone();
-            async move {
-                while let Some((stream, _local, remote)) = tcp_listener.next().await {
-                    let sem = tcp_sem.clone();
-                    let host = socks_host.clone();
-                    // Drop connection immediately if saturated to avoid lwIP backlog ("tcp full")
-                    if let Ok(permit) = sem.try_acquire_owned() {
-                        tokio::spawn(async move {
-                            let _permit = permit;
-                            handle_tcp_stream_via_socks(stream, remote, host, socks_port).await;
-                        });
-                    } else {
-                        log::warn!("[TUN][WIN] dropping TCP stream due to saturation: {}", remote);
-                        // stream dropped here
-                    }
+            });
+        }
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                use tokio::io::{AsyncBufReadExt, BufReader};
+                let mut r = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = r.next_line().await {
+                    if !line.trim().is_empty() { log::warn!("[SING-BOX][STDERR] {}", line); }
                 }
-            }
-        }));
+            });
+        }
 
-        // UDP handling: implement DNS via TCP-over-SOCKS; drop others (QUIC will fallback to TCP)
-        self.bridge_tasks.push(tokio::spawn(async move {
-            let (ls, mut lr) = udp_socket.split();
-            let ls = std::sync::Arc::new(ls);
-            let socks_host = socks_host.clone();
-            let socks_port = socks_port;
-            loop {
-                match lr.recv_from().await {
-                    Ok((data, src_addr, dst_addr)) => {
-                        if dst_addr.port() == 53 {
-                            let ls_cloned = ls.clone();
-                            let host = socks_host.clone();
-                            tokio::spawn(async move {
-                                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                                use tokio::net::TcpStream;
-                                // Connect SOCKS
-                                if let Ok(mut socks) = TcpStream::connect((host.as_str(), socks_port)).await {
-                                    if socks.write_all(&[0x05, 0x01, 0x00]).await.is_ok() {
-                                        let mut resp = [0u8;2];
-                                        if socks.read_exact(&mut resp).await.is_ok() && resp == [0x05, 0x00] {
-                                            // CONNECT to original dns server via TCP
-                                            if let std::net::IpAddr::V4(v4) = dst_addr.ip() {
-                                                let mut req = Vec::with_capacity(4+4+2);
-                                                req.extend_from_slice(&[0x05, 0x01, 0x00, 0x01]);
-                                                req.extend_from_slice(&v4.octets());
-                                                req.extend_from_slice(&dst_addr.port().to_be_bytes());
-                                                if socks.write_all(&req).await.is_ok() {
-                                                    let mut head = [0u8;4];
-                                                    if socks.read_exact(&mut head).await.is_ok() && head[1]==0x00 {
-                                                        let addr_len = match head[3] { 0x01 => 4, 0x03 => { let mut l=[0u8;1]; if socks.read_exact(&mut l).await.is_err(){return;} l[0] as usize }, 0x04 => 16, _ => 0 };
-                                                        if addr_len != 0 {
-                                                            let mut skip = vec![0u8; addr_len + 2];
-                                                            if socks.read_exact(&mut skip).await.is_ok() {
-                                                                // DNS over TCP
-                                                                let len = (data.len() as u16).to_be_bytes();
-                                                                if socks.write_all(&len).await.is_ok() && socks.write_all(&data).await.is_ok() {
-                                                                    let mut lbuf=[0u8;2];
-                                                                    if socks.read_exact(&mut lbuf).await.is_ok() {
-                                                                        let rlen = u16::from_be_bytes(lbuf) as usize;
-                                                                        let mut rbuf = vec![0u8; rlen];
-                                                                        if socks.read_exact(&mut rbuf).await.is_ok() {
-                                                                            let _ = ls_cloned.send_to(&rbuf, &dst_addr, &src_addr);
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            });
-                        } else {
-                            let host = socks_host.clone();
-                            tokio::spawn(async move {
-                                use tokio::net::TcpStream;
-                                // Optional UDP via SOCKS5 (disabled by default)
-                                if std::env::var("TUN_ENABLE_UDP").ok().as_deref() == Some("1") {
-                                    // (Feature gated) UDP path not implemented by default
-                                    let _ = TcpStream::connect((host.as_str(), socks_port)).await;
-                                }
-                            });
-                        }
-                    }
-                    Err(e) => { log::warn!("[TUN][WIN] UDP recv error: {}", e); break; }
-                }
-            }
-        }));
-
-        // Keep running
-        self.dev = None;
+        self.singbox_child = Some(child);
         self.is_running = true;
         Ok(())
     }
 
     pub async fn stop(&mut self) -> Result<()> {
         if !self.is_running { return Ok(()); }
-        log::info!("[TUN][WIN] Stopping Wintun + tun2socks");
-        if let Err(e) = self.clear_routes_windows() { log::warn!("[TUN][WIN] clear routes failed: {}", e); }
-        for h in self.bridge_tasks.drain(..) { h.abort(); }
-        self.dev.take();
+        log::info!("[TUN][WIN] Stopping sing-box");
+        if let Some(mut child) = self.singbox_child.take() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+        if let Some(cfg) = self.temp_config.take() {
+            let _ = std::fs::remove_file(cfg);
+        }
         self.is_running = false;
         Ok(())
     }
@@ -366,18 +273,37 @@ impl TunManager {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         let alias = &self.config.name;
-        // Prepare optional exclusion for remote SS server IP (from env SS_REMOTE_HOST)
+        // Prepare optional exclusion for remote SS server IP(s) (from env SS_REMOTE_HOST, SS_REMOTE_PORT)
         let remote_ip_rule = {
-            use std::net::ToSocketAddrs;
+            use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+            let mut lines = String::new();
             if let Ok(host) = std::env::var("SS_REMOTE_HOST") {
-                if let Ok(mut it) = (host.as_str(), 0u16).to_socket_addrs() {
-                    if let Some(sa) = it.find(|sa| sa.is_ipv4()) {
-                        if let std::net::IpAddr::V4(v4) = sa.ip() {
-                            format!("              New-NetRoute -DestinationPrefix {}/32 -InterfaceIndex $mainIndex -RouteMetric 1 -NextHop 0.0.0.0 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null;\n", v4)
-                        } else { String::new() }
-                    } else { String::new() }
-                } else { String::new() }
-            } else { String::new() }
+                // If it's already an IPv4 literal, add it directly
+                if let Ok(IpAddr::V4(v4)) = host.parse::<IpAddr>() {
+                    lines.push_str(&format!(
+                        "              New-NetRoute -DestinationPrefix {}/32 -InterfaceIndex $mainIndex -RouteMetric 1 -NextHop 0.0.0.0 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null;\n",
+                        v4
+                    ));
+                } else {
+                    // Resolve all IPv4 A records
+                    let port: u16 = std::env::var("SS_REMOTE_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(443);
+                    if let Ok(iter) = (host.as_str(), port).to_socket_addrs() {
+                        let mut seen: std::collections::BTreeSet<Ipv4Addr> = std::collections::BTreeSet::new();
+                        for sa in iter {
+                            if let IpAddr::V4(v4) = sa.ip() {
+                                if seen.insert(v4) {
+                                    lines.push_str(&format!(
+                                        "              New-NetRoute -DestinationPrefix {}/32 -InterfaceIndex $mainIndex -RouteMetric 1 -NextHop 0.0.0.0 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null;\n",
+                                        v4
+                                    ));
+                                }
+                                if seen.len() >= 8 { break; }
+                            }
+                        }
+                    }
+                }
+            }
+            lines
         };
         // Wait until adapter appears and fetch InterfaceIndex, then add split routes
         let ps = format!(
@@ -400,6 +326,9 @@ impl TunManager {
               if ($cand) {{ $mainIndex = $cand.ifIndex }}
             }}
 
+            Write-Output ("IDX=" + $idx);
+            if ($mainIndex -ne $null) {{ Write-Output ("MAIN=" + $mainIndex); }}
+
             # Ensure local loopback and private ranges stay off the TUN
             if ($mainIndex -ne $null) {{
               New-NetRoute -DestinationPrefix 127.0.0.0/8 -InterfaceIndex $mainIndex -RouteMetric 1 -NextHop 0.0.0.0 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null;
@@ -409,7 +338,8 @@ impl TunManager {
               New-NetRoute -DestinationPrefix 169.254.0.0/16 -InterfaceIndex $mainIndex -RouteMetric 1 -NextHop 0.0.0.0 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null;
               New-NetRoute -DestinationPrefix 224.0.0.0/4 -InterfaceIndex $mainIndex -RouteMetric 1 -NextHop 0.0.0.0 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null;
               New-NetRoute -DestinationPrefix 255.255.255.255/32 -InterfaceIndex $mainIndex -RouteMetric 1 -NextHop 0.0.0.0 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null;
-{remote_ip_rule}            }}
+{remote_ip_rule}              Write-Output "EXCLUDES_APPLIED=1";
+            }}
 
             # Prefer the TUN by metric and set MTU 1400 for stability
             Set-NetIPInterface -InterfaceIndex $idx -AutomaticMetric Disabled -NlMtuBytes 1400 -InterfaceMetric 5 -ErrorAction SilentlyContinue | Out-Null;
@@ -439,6 +369,8 @@ impl TunManager {
                     );
                     return Err(anyhow::anyhow!("configure_routes_windows failed"));
                 }
+                let so = String::from_utf8_lossy(&o.stdout);
+                if !so.trim().is_empty() { log::info!("[TUN][WIN] routes stdout: {}", so.trim()); }
                 Ok(())
             }
             Err(e) => {
@@ -648,6 +580,185 @@ fn get_socks_endpoint() -> (String, u16) {
         if !hostport.is_empty() { return (hostport.to_string(), 1080); }
     }
     ("127.0.0.1".to_string(), 1080)
+}
+
+#[cfg(target_os = "windows")]
+fn find_singbox_path() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let exe_dir = dir.to_path_buf();
+            let mut candidates = vec![
+                exe_dir.join("sing-box.exe"),
+                exe_dir.join("bin").join("sing-box.exe"),
+                exe_dir.join("resources").join("sing-box.exe"),
+                exe_dir.join("resources").join("sing-box").join("sing-box.exe"),
+            ];
+            // Dev-path: target/<profile>/ -> crate_dir/resources/sing-box/sing-box.exe
+            if let Some(target_dir) = exe_dir.parent() { // .../target
+                if let Some(crate_dir) = target_dir.parent() { // .../src-tauri
+                    candidates.push(crate_dir.join("resources").join("sing-box").join("sing-box.exe"));
+                }
+            }
+            for c in candidates { if c.exists() { return Some(c); } }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn build_singbox_config(cfg: &TunConfig, socks_host: String, socks_port: u16) -> Result<PathBuf> {
+    use serde_json::json;
+    // Collect remote server IP exclusions from SS_REMOTE_HOST
+    let mut direct_cidrs: Vec<String> = vec![
+        "127.0.0.0/8".to_string(),
+        "10.0.0.0/8".to_string(),
+        "172.16.0.0/12".to_string(),
+        "192.168.0.0/16".to_string(),
+        "169.254.0.0/16".to_string(),
+        "224.0.0.0/4".to_string(),
+        "255.255.255.255/32".to_string(),
+    ];
+    if let Ok(host) = std::env::var("SS_REMOTE_HOST") {
+        use std::net::{IpAddr, ToSocketAddrs};
+        let port: u16 = std::env::var("SS_REMOTE_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(443);
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            if let IpAddr::V4(v4) = ip { direct_cidrs.push(format!("{}/32", v4)); }
+        } else if let Ok(iter) = (host.as_str(), port).to_socket_addrs() {
+            use std::collections::BTreeSet;
+            let mut seen = BTreeSet::new();
+            for sa in iter {
+                if let IpAddr::V4(v4) = sa.ip() {
+                    if seen.insert(v4) { direct_cidrs.push(format!("{}/32", v4)); }
+                    if seen.len() >= 8 { break; }
+                }
+            }
+        }
+    }
+
+    let inet4 = format!("{}/{}", cfg.address, {
+        let mask = u32::from(cfg.netmask);
+        mask.count_ones() as u8
+    });
+
+    // Outbounds depend on SB_OUTBOUND_TYPE
+    let outbound_type = std::env::var("SB_OUTBOUND_TYPE").unwrap_or_else(|_| "socks".to_string());
+    // Build outbounds and DNS config
+    let outbounds = if outbound_type == "vless" {
+        let server = std::env::var("SB_VLESS_SERVER").unwrap_or_else(|_| "".into());
+        let port: u16 = std::env::var("SB_VLESS_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(443);
+        let uuid = std::env::var("SB_VLESS_UUID").unwrap_or_else(|_| "".into());
+        let security = std::env::var("SB_VLESS_SECURITY").unwrap_or_else(|_| "reality".into());
+        let sni = std::env::var("SB_VLESS_SNI").unwrap_or_else(|_| "".into());
+        let fp = std::env::var("SB_VLESS_FP").unwrap_or_else(|_| "chrome".into());
+        let flow = std::env::var("SB_VLESS_FLOW").unwrap_or_else(|_| "".into());
+        let pbk = std::env::var("SB_VLESS_PBK").unwrap_or_else(|_| "".into());
+        let sid = std::env::var("SB_VLESS_SID").unwrap_or_else(|_| "".into());
+
+        json!([
+            {
+                "type": "vless",
+                "tag": "proxy",
+                "server": server,
+                "server_port": port,
+                "uuid": uuid,
+                "flow": flow,
+                "packet_encoding": "",
+                "domain_resolver": "dns-direct",
+                "tls": {
+                    "enabled": true,
+                    "server_name": sni,
+                    "utls": { "enabled": true, "fingerprint": fp },
+                    "reality": {
+                        "enabled": security == "reality",
+                        "public_key": pbk,
+                        "short_id": sid
+                    }
+                }
+            },
+            { "type": "direct", "tag": "direct" }
+        ])
+    } else {
+        json!([
+            {
+                "type": "socks",
+                "tag": "proxy",
+                "server": socks_host,
+                "server_port": socks_port,
+                "version": "5",
+                "udp_over_tcp": true
+            },
+            { "type": "direct", "tag": "direct" }
+        ])
+    };
+
+    // Build DNS config to avoid bootstrap/ERR_NAME_NOT_RESOLVED
+    let mut dns_rules: Vec<serde_json::Value> = Vec::new();
+    if let Ok(host) = std::env::var("SB_VLESS_SERVER") {
+        // Only add rule if looks like a domain (not IPv4)
+        if host.chars().any(|c| c.is_alphabetic()) {
+            dns_rules.push(json!({ "domain": [host], "server": "dns-direct" }));
+        }
+    }
+    dns_rules.push(json!({ "query_type": [32, 33], "server": "dns-block" }));
+    dns_rules.push(json!({ "domain_suffix": [".lan"], "server": "dns-block" }));
+ // Повыше: поставь "level": "debug" или "trace".
+// Потише: "warn" или "error".
+    // Build inbounds: TUN always; optional mixed inbound gated by env to avoid bind conflicts
+    let mut inbounds: Vec<serde_json::Value> = vec![json!({
+        "type": "tun",
+        "interface_name": cfg.name,
+        "address": [ inet4 ],
+        "mtu": 1400,
+        "auto_route": true,
+        "strict_route": true,
+        "endpoint_independent_nat": true,
+        "sniff": true,
+        "sniff_override_destination": false,
+        "stack": "gvisor"
+    })];
+    if std::env::var("SINGBOX_ENABLE_MIXED").ok().as_deref() == Some("1") {
+        let mixed_port: u16 = std::env::var("SINGBOX_MIXED_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(1081);
+        inbounds.push(json!({
+            "type": "mixed",
+            "tag": "mixed-in",
+            "listen": "127.0.0.1",
+            "listen_port": mixed_port,
+            "sniff": true,
+            "sniff_override_destination": false
+        }));
+    }
+
+    let doc = json!({
+        "log": { "level": "warn" },
+        "inbounds": inbounds,
+        "dns": {
+            "independent_cache": true,
+            "rules": dns_rules,
+            "servers": [
+                { "address": "https://doh.pub/dns-query",    "address_resolver": "dns-local", "detour": "direct", "tag": "dns-direct" },
+                { "address": "rcode://success",               "tag": "dns-block" },
+                { "address": "local",                         "detour": "direct", "tag": "dns-local" }
+            ]
+        },
+        "outbounds": outbounds,
+        "route": {
+            "auto_detect_interface": true,
+            "default_domain_resolver": "dns-direct",
+            "final": "proxy",
+            "rules": [
+                { "protocol": "dns", "action": "hijack-dns" },
+                { "ip_cidr": direct_cidrs, "action": "direct" },
+                { "network": "udp", "port": [135,137,138,139,5353], "action": "reject" },
+                { "ip_cidr": ["224.0.0.0/3","ff00::/8"], "action": "reject" },
+                { "source_ip_cidr": ["224.0.0.0/3","ff00::/8"], "action": "reject" }
+            ]
+        }
+    });
+
+    let temp = std::env::temp_dir().join(format!("crabsock-singbox-{}.json", std::process::id()));
+    std::fs::write(&temp, doc.to_string())
+        .map_err(|e| anyhow::anyhow!(format!("write sing-box config failed: {}", e)))?;
+    Ok(temp)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]

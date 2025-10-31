@@ -1,6 +1,6 @@
 use crate::config::ProxyConfig;
 use crate::error::{VpnError, VpnResult};
-use crate::shadowsocks::{ShadowsocksClient as SsClient, ShadowsocksConfig};
+// shadowsocks types are imported where used to avoid unused warnings across targets
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -57,37 +57,32 @@ impl ShadowsocksClient {
             use tokio::net::TcpStream;
             use tokio::time::{timeout, Duration};
             let target = format!("{}:{}", server, port);
+            let timeout_ms: u64 = std::env::var("WIN_PREFLIGHT_TIMEOUT_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(8000);
             let mut last_err: Option<String> = None;
             let mut resolved_any = false;
             match tokio::net::lookup_host(&target).await {
                 Ok(addrs) => {
                     for addr in addrs {
                         resolved_any = true;
-                        log::info!("[WIN] Preflight trying {}", addr);
-                        match timeout(Duration::from_secs(5), TcpStream::connect(addr)).await {
+                        log::info!("[WIN] Preflight trying {} ({} ms)", addr, timeout_ms);
+                        match timeout(Duration::from_millis(timeout_ms), TcpStream::connect(addr)).await {
                             Ok(Ok(_s)) => {
                                 log::info!("[WIN] Upstream {} is reachable (TCP preflight)", addr);
                                 last_err = None;
                                 break;
                             }
-                            Ok(Err(e)) => {
-                                last_err = Some(format!("connect {} failed: {}", addr, e));
-                            }
-                            Err(_) => {
-                                last_err = Some(format!("connect {} timed out", addr));
-                            }
+                            Ok(Err(e)) => { last_err = Some(format!("connect {} failed: {}", addr, e)); }
+                            Err(_) => { last_err = Some(format!("connect {} timed out ({} ms)", addr, timeout_ms)); }
                         }
                     }
                 }
-                Err(e) => {
-                    last_err = Some(format!("DNS resolve failed for {}: {}", target, e));
-                }
+                Err(e) => { last_err = Some(format!("DNS resolve failed for {}: {}", target, e)); }
             }
             if !resolved_any {
-                return Err(format!("Windows preflight: no addresses resolved for {}", target).into());
+                log::warn!("[WIN] Preflight DNS resolved no addresses for {} — continuing to try anyway", target);
             }
             if let Some(err) = last_err {
-                return Err(format!("Windows preflight failed: {}", err).into());
+                log::warn!("[WIN] Preflight failed: {} — continuing to start Shadowsocks", err);
             }
         }
 
@@ -130,27 +125,24 @@ impl ProxyClient for ShadowsocksClient {
             use tokio::net::TcpStream;
             use tokio::time::{timeout, Duration};
             let target = format!("{}:{}", server, port);
+            let timeout_ms: u64 = std::env::var("WIN_PREFLIGHT_TIMEOUT_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(8000);
             let mut last_err: Option<String> = None;
             let mut resolved_any = false;
             match tokio::net::lookup_host(&target).await {
                 Ok(addrs) => {
                     for addr in addrs {
                         resolved_any = true;
-                        match timeout(Duration::from_secs(5), TcpStream::connect(addr)).await {
+                        match timeout(Duration::from_millis(timeout_ms), TcpStream::connect(addr)).await {
                             Ok(Ok(_)) => { last_err = None; break; }
                             Ok(Err(e)) => { last_err = Some(format!("connect {} failed: {}", addr, e)); }
-                            Err(_) => { last_err = Some(format!("connect {} timed out", addr)); }
+                            Err(_) => { last_err = Some(format!("connect {} timed out ({} ms)", addr, timeout_ms)); }
                         }
                     }
                 }
                 Err(e) => { last_err = Some(format!("DNS resolve failed for {}: {}", target, e)); }
             }
-            if !resolved_any {
-                return Err(VpnError::ConnectionFailed(format!("Windows preflight: no addresses resolved for {}", target)));
-            }
-            if let Some(err) = last_err {
-                return Err(VpnError::ConnectionFailed(format!("Windows preflight failed: {}", err)));
-            }
+            if !resolved_any { log::warn!("[WIN] Preflight DNS resolved no addresses for {} — continuing", target); }
+            if let Some(err) = last_err { log::warn!("[WIN] Preflight failed: {} — continuing", err); }
         }
 
         let task = tokio::spawn(async move {
@@ -200,6 +192,182 @@ pub struct VmessClient {
     config: ProxyConfig,
     status: ConnectionStatus,
     task: Option<tokio::task::JoinHandle<()>>,
+}
+
+pub struct VlessClient {
+    config: ProxyConfig,
+    status: ConnectionStatus,
+    child: Option<tokio::process::Child>,
+}
+
+impl VlessClient {
+    pub fn new(config: ProxyConfig) -> Self {
+        Self { config, status: ConnectionStatus::Disconnected, child: None }
+    }
+
+    fn build_singbox_config_json(&self) -> serde_json::Value {
+        let server = self.config.server.clone();
+        let port = self.config.port;
+        let uuid = self.config.uuid.clone().unwrap_or_default();
+        let tls_enabled = self.config.tls.unwrap_or(false);
+        let sni = self.config.sni.clone().unwrap_or_default();
+        let network = self.config.network.clone().unwrap_or_else(|| "tcp".to_string());
+        let ws_path = self.config.ws_path.clone().unwrap_or_default();
+        let ws_headers = self.config.ws_headers.clone().unwrap_or_default();
+
+        let mut outbound = serde_json::json!({
+            "type": "vless",
+            "server": server,
+            "server_port": port,
+            "uuid": uuid,
+        });
+
+        if tls_enabled {
+            let mut tls = serde_json::json!({ "enabled": true });
+            if !sni.is_empty() { tls["server_name"] = serde_json::Value::String(sni); }
+            if let Some(skip) = self.config.skip_cert_verify { if skip { tls["insecure"] = serde_json::Value::Bool(true); } }
+            outbound["tls"] = tls;
+        }
+
+        if network == "ws" {
+            let mut transport = serde_json::json!({ "type": "ws" });
+            if !ws_path.is_empty() { transport["path"] = serde_json::Value::String(ws_path); }
+            if !ws_headers.is_empty() { transport["headers"] = serde_json::to_value(ws_headers).unwrap_or(serde_json::json!({})); }
+            outbound["transport"] = transport;
+        }
+
+        serde_json::json!({
+            "log": { "level": "info" },
+            "inbounds": [
+                { "type": "socks", "listen": "127.0.0.1", "listen_port": 1080, "sniff": true, "sniff_override_destination": true }
+            ],
+            "outbounds": [ outbound ]
+        })
+    }
+
+    fn resolve_singbox_path() -> std::path::PathBuf {
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                candidates.push(dir.join("sing-box.exe"));
+                candidates.push(dir.join("resources").join("sing-box").join("sing-box.exe"));
+                candidates.push(dir.join("resources").join("sing-box.exe"));
+            }
+        }
+        // workspace dev fallback
+        candidates.push(std::path::PathBuf::from("./src-tauri/resources/sing-box/sing-box.exe"));
+        candidates.into_iter().find(|p| p.exists()).unwrap_or_else(|| std::path::PathBuf::from("sing-box.exe"))
+    }
+}
+
+impl Drop for VlessClient {
+    fn drop(&mut self) {
+        // Best-effort synchronous termination on drop to avoid orphaned processes on abrupt shutdown paths
+        if let Some(mut child) = self.child.take() {
+            #[cfg(target_os = "windows")]
+            {
+                // Try hard kill via taskkill to ensure file handles are released
+                if let Some(pid) = child.id() {
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/PID", &pid.to_string(), "/T", "/F"]) // kill the process tree
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+            }
+            let _ = child.start_kill(); // non-blocking best-effort for non-Windows too
+        }
+    }
+}
+
+#[async_trait]
+impl ProxyClient for VlessClient {
+    async fn connect(&mut self) -> VpnResult<()> {
+        if matches!(self.status, ConnectionStatus::Connected | ConnectionStatus::Connecting) {
+            return Err(VpnError::AlreadyConnected);
+        }
+        self.status = ConnectionStatus::Connecting;
+
+        // Preflight basic TCP reachability to the remote
+        #[cfg(target_os = "windows")]
+        {
+            use tokio::net::TcpStream;
+            use tokio::time::{timeout, Duration};
+            let target = format!("{}:{}", self.config.server, self.config.port);
+            let timeout_ms: u64 = std::env::var("WIN_PREFLIGHT_TIMEOUT_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(8000);
+            let mut any_ok = false;
+            if let Ok(addrs) = tokio::net::lookup_host(&target).await {
+                for addr in addrs {
+                    if let Ok(Ok(_)) = timeout(Duration::from_millis(timeout_ms), TcpStream::connect(addr)).await { any_ok = true; break; }
+                }
+            }
+            if !any_ok { log::warn!("[WIN] Preflight to {} failed (timeout={})", target, timeout_ms); }
+        }
+
+        // Write sing-box config
+        let cfg = self.build_singbox_config_json();
+        let cfg_path = std::env::temp_dir().join("crabsock_vless_singbox.json");
+        match tokio::fs::write(&cfg_path, serde_json::to_vec_pretty(&cfg).unwrap()).await {
+            Ok(_) => {}
+            Err(e) => return Err(VpnError::ConnectionFailed(format!("Failed to write sing-box config: {}", e))),
+        }
+
+        let sb_path = Self::resolve_singbox_path();
+        log::info!("[VLESS] Starting sing-box: {:?} -c {}", sb_path, cfg_path.display());
+
+        #[cfg(target_os = "windows")]
+        use std::os::windows::process::CommandExt;
+
+        let mut cmd = tokio::process::Command::new(sb_path);
+        cmd.arg("run").arg("-c").arg(&cfg_path);
+        #[cfg(target_os = "windows")]
+        { cmd.creation_flags(0x08000000); } // CREATE_NO_WINDOW
+        cmd.kill_on_drop(true);
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+
+        match cmd.spawn() {
+            Ok(child) => {
+                self.child = Some(child);
+                // leave status as Connecting; caller will mark_connected() after IP verify
+                Ok(())
+            }
+            Err(e) => Err(VpnError::ConnectionFailed(format!("Failed to start sing-box: {}", e)))
+        }
+    }
+
+    async fn disconnect(&mut self) -> VpnResult<()> {
+        if let Some(mut child) = self.child.take() {
+            // First try graceful kill
+            let _ = child.kill().await;
+            // Then wait for the process to exit to release all handles
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(1500), child.wait()).await;
+
+            // If still alive on Windows, escalate with taskkill /T /F
+            #[cfg(target_os = "windows")]
+            {
+                if let Some(pid) = child.id() {
+                    // Double-check with a small wait; if the process is still around, force kill the tree
+                    use tokio::process::Command as TokioCommand;
+                    let _ = TokioCommand::new("taskkill")
+                        .args(["/PID", &pid.to_string(), "/T", "/F"]) // kill process tree, force
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .await;
+                }
+            }
+        }
+        self.status = ConnectionStatus::Disconnected;
+        Ok(())
+    }
+
+    async fn get_status(&self) -> ConnectionStatus { self.status.clone() }
+    async fn is_connected(&self) -> bool { matches!(self.status, ConnectionStatus::Connected) }
+    fn set_status_connected(&mut self) { self.status = ConnectionStatus::Connected; }
+    fn set_status_error(&mut self, msg: String) { self.status = ConnectionStatus::Error(msg); }
 }
 
 impl VmessClient {
@@ -337,6 +505,9 @@ impl ProxyManager {
             }
             crate::config::ProxyType::VMess => {
                 Box::new(VmessClient::new(config))
+            }
+            crate::config::ProxyType::VLESS => {
+                Box::new(VlessClient::new(config))
             }
             crate::config::ProxyType::SOCKS5 => {
                 Box::new(Socks5Client::new(config))
