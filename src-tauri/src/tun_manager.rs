@@ -252,12 +252,17 @@ impl TunManager {
             async move {
                 while let Some((stream, _local, remote)) = tcp_listener.next().await {
                     let sem = tcp_sem.clone();
-                        let host = socks_host.clone();
+                    let host = socks_host.clone();
+                    // Drop connection immediately if saturated to avoid lwIP backlog ("tcp full")
+                    if let Ok(permit) = sem.try_acquire_owned() {
                         tokio::spawn(async move {
-                        // backpressure instead of dropping
-                        let _permit = sem.acquire_owned().await.ok();
+                            let _permit = permit;
                             handle_tcp_stream_via_socks(stream, remote, host, socks_port).await;
                         });
+                    } else {
+                        log::warn!("[TUN][WIN] dropping TCP stream due to saturation: {}", remote);
+                        // stream dropped here
+                    }
                 }
             }
         }));
@@ -379,24 +384,25 @@ impl TunManager {
             r#"
             $alias = '{alias}';
             $idx = $null;
-            $mainIndex = $null;
             for ($i=0; $i -lt 40; $i++) {{
               $a = Get-NetAdapter -InterfaceAlias $alias -ErrorAction SilentlyContinue;
               if ($a) {{ $idx = $a.ifIndex; break; }}
               Start-Sleep -Milliseconds 250;
             }}
             if ($idx -eq $null) {{ throw 'adapter not found'; }}
+
             # Detect primary interface (default route owner) not equal to TUN
+            $mainIndex = $null;
             $def = Get-NetRoute -DestinationPrefix 0.0.0.0/0 -ErrorAction SilentlyContinue | Sort-Object -Property RouteMetric,InterfaceMetric | Select-Object -First 1;
             if ($def -and $def.InterfaceIndex -ne $idx) {{ $mainIndex = $def.InterfaceIndex }}
             if ($mainIndex -eq $null) {{
               $cand = Get-NetAdapter -Physical | Where-Object {{ $_.Status -eq 'Up' -and $_.ifIndex -ne $idx }} | Select-Object -First 1;
               if ($cand) {{ $mainIndex = $cand.ifIndex }}
             }}
-            # Ensure local loopback stays local (exclude from full-tunnel)
+
+            # Ensure local loopback and private ranges stay off the TUN
             if ($mainIndex -ne $null) {{
               New-NetRoute -DestinationPrefix 127.0.0.0/8 -InterfaceIndex $mainIndex -RouteMetric 1 -NextHop 0.0.0.0 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null;
-              # Exclude common private/link-local/multicast ranges from TUN
               New-NetRoute -DestinationPrefix 10.0.0.0/8 -InterfaceIndex $mainIndex -RouteMetric 1 -NextHop 0.0.0.0 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null;
               New-NetRoute -DestinationPrefix 172.16.0.0/12 -InterfaceIndex $mainIndex -RouteMetric 1 -NextHop 0.0.0.0 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null;
               New-NetRoute -DestinationPrefix 192.168.0.0/16 -InterfaceIndex $mainIndex -RouteMetric 1 -NextHop 0.0.0.0 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null;
@@ -404,11 +410,10 @@ impl TunManager {
               New-NetRoute -DestinationPrefix 224.0.0.0/4 -InterfaceIndex $mainIndex -RouteMetric 1 -NextHop 0.0.0.0 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null;
               New-NetRoute -DestinationPrefix 255.255.255.255/32 -InterfaceIndex $mainIndex -RouteMetric 1 -NextHop 0.0.0.0 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null;
 {remote_ip_rule}            }}
-            }}
+
             # Prefer the TUN by metric and set MTU 1400 for stability
             Set-NetIPInterface -InterfaceIndex $idx -AutomaticMetric Disabled -NlMtuBytes 1400 -InterfaceMetric 5 -ErrorAction SilentlyContinue | Out-Null;
             # On-link split default routes (avoid specifying a gateway for L3 TUN)
-            # Use InterfaceAlias and IPv4 family explicitly to ensure creation
             New-NetRoute -DestinationPrefix 0.0.0.0/1 -InterfaceAlias $alias -AddressFamily IPv4 -RouteMetric 5 -NextHop 0.0.0.0 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null;
             New-NetRoute -DestinationPrefix 128.0.0.0/1 -InterfaceAlias $alias -AddressFamily IPv4 -RouteMetric 5 -NextHop 0.0.0.0 -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null;
             # Fallback with legacy route.exe in case New-NetRoute silently fails
@@ -418,14 +423,29 @@ impl TunManager {
             alias=alias,
             remote_ip_rule=remote_ip_rule
         );
-        let status = Command::new("powershell")
+        let output = Command::new("powershell")
             .creation_flags(CREATE_NO_WINDOW)
             .args(["-NoProfile", "-NonInteractive", "-NoLogo", "-WindowStyle", "Hidden", "-Command", &ps])
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        match status { Ok(_s) => Ok(()), _ => Ok(()) }
+            .output();
+        match output {
+            Ok(o) => {
+                if !o.status.success() {
+                    log::error!(
+                        "[TUN][WIN] configure_routes_windows failed: status={:?}, stdout={}, stderr={}",
+                        o.status.code(),
+                        String::from_utf8_lossy(&o.stdout),
+                        String::from_utf8_lossy(&o.stderr)
+                    );
+                    return Err(anyhow::anyhow!("configure_routes_windows failed"));
+                }
+                Ok(())
+            }
+            Err(e) => {
+                log::error!("[TUN][WIN] configure_routes_windows spawn error: {}", e);
+                Err(anyhow::anyhow!("configure_routes_windows spawn error"))
+            }
+        }
     }
 
     fn clear_routes_windows(&self) -> Result<()> {
@@ -476,20 +496,35 @@ impl TunManager {
               Start-Sleep -Milliseconds 250;
             }}
             if ($idx -eq $null) {{ throw 'adapter not found'; }}
+            # Ensure MTU/metric on TUN early
+            Set-NetIPInterface -InterfaceIndex $idx -AutomaticMetric Disabled -NlMtuBytes 1400 -InterfaceMetric 5 -ErrorAction SilentlyContinue | Out-Null;
             if (!(Get-NetIPAddress -InterfaceIndex $idx -AddressFamily IPv4 -ErrorAction SilentlyContinue)) {{
               New-NetIPAddress -IPAddress {ip} -PrefixLength {prefix} -InterfaceIndex $idx -PolicyStore ActiveStore -ErrorAction SilentlyContinue | Out-Null;
             }}
             "#,
             alias=alias, ip=ip, prefix=prefix
         );
-        let status = Command::new("powershell")
+        let output = Command::new("powershell")
             .creation_flags(CREATE_NO_WINDOW)
             .args(["-NoProfile", "-NonInteractive", "-NoLogo", "-WindowStyle", "Hidden", "-Command", &ps])
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        match status { Ok(s) if s.success() => Ok(()), _ => Err(anyhow::anyhow!("ip assign failed")) }
+            .output();
+        match output {
+            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) => {
+                log::error!(
+                    "[TUN][WIN] configure_ip_windows failed: status={:?}, stdout={}, stderr={}",
+                    o.status.code(),
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                Err(anyhow::anyhow!("ip assign failed"))
+            }
+            Err(e) => {
+                log::error!("[TUN][WIN] configure_ip_windows spawn error: {}", e);
+                Err(anyhow::anyhow!("ip assign spawn failed"))
+            }
+        }
     }
 
     fn spawn_native_tun2socks_loop(&mut self) { /* replaced by start() bridge tasks */ }
