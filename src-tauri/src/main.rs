@@ -41,8 +41,7 @@ fn main() {
         let args: Vec<String> = std::env::args().collect();
         if let Some(arg) = args.iter().find(|a| a.starts_with("--set-routing=")) {
             let val = arg.trim_start_matches("--set-routing=").to_lowercase();
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let _ = rt.block_on(async {
+            tauri::async_runtime::block_on(async {
                 if let Ok(manager) = ConfigManager::new() {
                     if let Ok(mut file) = manager.load_configs().await {
                         file.settings.routing_mode = if val == "tun" { crab_sock::config_manager::RoutingMode::Tun } else { crab_sock::config_manager::RoutingMode::SystemProxy };
@@ -79,7 +78,7 @@ fn main() {
     }
 
     // Инициализируем конфиги при старте приложения
-    tokio::runtime::Runtime::new().unwrap().block_on(async {
+    tauri::async_runtime::block_on(async {
         match ConfigManager::new() {
             Ok(config_manager) => {
                 match config_manager.load_configs().await {
@@ -100,16 +99,14 @@ fn main() {
     // Handle Ctrl+C / console close to gracefully tear down external processes
     {
         let _ = ctrlc::set_handler(|| {
-            // Fire-and-forget: best effort cleanup
+            // Fire-and-forget: best effort cleanup without creating a new runtime
             std::thread::spawn(|| {
-                if let Ok(rt) = tokio::runtime::Runtime::new() {
-                    rt.block_on(async {
-                        crab_sock::commands::disconnect_vpn_silent().await;
-                        let _ = crab_sock::commands::disable_tun_mode().await;
-                        let _ = crab_sock::commands::clear_system_proxy().await;
-                    });
-                }
-                // Give the OS a moment to release file handles
+                tauri::async_runtime::spawn(async {
+                    crab_sock::commands::disconnect_vpn_silent().await;
+                    let _ = crab_sock::commands::disable_tun_mode().await;
+                    let _ = crab_sock::commands::clear_system_proxy().await;
+                });
+                // Give the async tasks a moment, then exit
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 std::process::exit(0);
             });

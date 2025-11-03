@@ -10,6 +10,11 @@ pub mod tun_manager;
 pub mod linux_capabilities;
 pub mod windows_firewall;
 pub mod acl_http_proxy;
+pub mod outbound;
+pub mod singbox;
+pub mod tun;
+pub mod net;
+pub mod runtime_settings;
 
 pub use error::VpnError;
 pub use config::*;

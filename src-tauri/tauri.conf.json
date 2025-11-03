@@ -26,10 +26,6 @@
     "active": true,
     "targets": ["deb", "rpm", "app", "dmg","msi"],
     "resources": [
-      "resources/wintun/bin/amd64/wintun.dll",
-      "resources/wintun/bin/arm64/wintun.dll",
-      "resources/wintun/bin/x86/wintun.dll",
-      "resources/wintun/bin/arm/wintun.dll",
       "resources/sing-box/sing-box.exe"
     ],
     "icon": [
