@@ -68,6 +68,11 @@ export const useVpnStore = defineStore('vpn', {
     },
     configPath: '',
     routingMode: 'systemproxy' as 'systemproxy' | 'tun',
+    // OpenVPN state
+    openvpnConfigs: [] as { name: string; path: string; display_name?: string; remote?: string }[],
+    openvpnStatus: 'disconnected' as Status,
+    openvpnActiveConfig: '' as string,
+    openvpnLogs: [] as string[],
   }),
   actions: {
     addLog(level: 'info' | 'warn' | 'error', message: string, source: 'frontend' | 'backend' = 'frontend') {
@@ -131,6 +136,19 @@ export const useVpnStore = defineStore('vpn', {
         }
       })
 
+      // OpenVPN events
+      listen('openvpn-status', (e: any) => {
+        const payload = e.payload as { status: Status; detail?: string }
+        this.openvpnStatus = payload.status
+        this.addLog('info', `[OpenVPN] ${payload.status}${payload?.detail ? `: ${payload.detail}` : ''}`, 'backend')
+      })
+      listen('openvpn-log', (e: any) => {
+        const line = String(e.payload ?? '')
+        if (!line) return
+        this.openvpnLogs.push(line)
+        if (this.openvpnLogs.length > 500) this.openvpnLogs = this.openvpnLogs.slice(-500)
+      })
+
       // Listen for IP verification events
       listen('ip_verified', (e: any) => {
         const ipInfo = e.payload as { ip: string; country?: string }
@@ -181,6 +199,54 @@ export const useVpnStore = defineStore('vpn', {
         await this.refreshIp()
       } catch (e) {
         // refreshIp уже залогирует ошибку
+      }
+    },
+    async refreshOpenVpnConfigs() {
+      try {
+        const items = await invoke('openvpn_list_configs') as { name: string; path: string }[]
+        this.openvpnConfigs = items
+      } catch (e) {
+        this.addLog('error', `Failed to list OpenVPN configs: ${e}`, 'frontend')
+      }
+    },
+    async uploadOpenVpnConfig(file: File) {
+      const name = file.name.replace(/\.ovpn$/i, '')
+      const content = await file.text()
+      try {
+        await invoke('openvpn_add_config', { name, content })
+        await this.refreshOpenVpnConfigs()
+        this.addLog('info', `OpenVPN config saved: ${file.name}`, 'frontend')
+      } catch (e) {
+        this.addLog('error', `Failed to save OpenVPN config: ${e}`, 'frontend')
+      }
+    },
+    async connectOpenVpn(name: string) {
+      this.openvpnActiveConfig = name
+      this.openvpnStatus = 'connecting'
+      try {
+        await invoke('openvpn_connect', { name })
+      } catch (e) {
+        this.openvpnStatus = 'disconnected'
+        this.addLog('error', `OpenVPN connect failed: ${e}`, 'frontend')
+      }
+    },
+    async disconnectOpenVpn() {
+      try {
+        await invoke('openvpn_disconnect')
+        this.openvpnStatus = 'disconnected'
+        this.openvpnActiveConfig = ''
+        // Hide logs on disconnect
+        this.openvpnLogs = []
+      } catch (e) {
+        this.addLog('error', `OpenVPN disconnect failed: ${e}`, 'frontend')
+      }
+    },
+    async removeOpenVpnConfig(name: string) {
+      try {
+        await invoke('openvpn_remove_config', { name })
+        await this.refreshOpenVpnConfigs()
+      } catch (e) {
+        this.addLog('error', `Failed to remove OpenVPN config: ${e}`, 'frontend')
       }
     },
     

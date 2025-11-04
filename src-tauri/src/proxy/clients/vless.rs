@@ -73,7 +73,10 @@ impl Drop for VlessClient {
             #[cfg(target_os = "windows")]
             {
                 if let Some(pid) = child.id() {
-                    let _ = std::process::Command::new("taskkill")
+                    let mut cmd = std::process::Command::new("taskkill");
+                    #[cfg(target_os = "windows")]
+                    { use std::os::windows::process::CommandExt; cmd.creation_flags(0x08000000); }
+                    let _ = cmd
                         .args(["/PID", &pid.to_string(), "/T", "/F"]) 
                         .stdin(std::process::Stdio::null())
                         .stdout(std::process::Stdio::null())
@@ -141,7 +144,10 @@ impl ProxyClient for VlessClient {
             {
                 if let Some(pid) = child.id() {
                     use tokio::process::Command as TokioCommand;
-                    let _ = TokioCommand::new("taskkill")
+                    let mut k = TokioCommand::new("taskkill");
+                    #[cfg(target_os = "windows")]
+                    { k.creation_flags(0x08000000); }
+                    let _ = k
                         .args(["/PID", &pid.to_string(), "/T", "/F"]) 
                         .stdin(std::process::Stdio::null())
                         .stdout(std::process::Stdio::null())

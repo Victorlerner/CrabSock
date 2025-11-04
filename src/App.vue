@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import ConfigInput from '@src/components/ConfigInput.vue'
-import ConnectButton from '@src/components/ConnectButton.vue'
+//import ConnectButton from '@src/components/ConnectButton.vue'
 import IpFlag from '@src/components/IpFlag.vue'
 import LoadingSpinner from '@src/components/LoadingSpinner.vue'
 import ConfigList from '@src/components/ConfigList.vue'
 import LogsPanel from '@src/components/LogsPanel.vue'
 import ConnectionStatus from '@src/components/ConnectionStatus.vue'
 import Settings from '@src/components/Settings.vue'
+import OpenVpnSection from '@src/components/OpenVpnSection.vue'
 import { onMounted } from 'vue'
 import { useVpnStore } from '@src/stores/vpnStore'
 
@@ -46,14 +47,16 @@ onMounted(() => store.init())
 
 
           <!-- Connect Button -->
-          <section  v-if="!store.showConfig" class="flex items-center gap-3">
-            <ConnectButton />
-          </section>
+<!--          <section  v-if="!store.showConfig" class="flex items-center gap-3">-->
+<!--            <ConnectButton />-->
+<!--          </section>-->
+          <OpenVpnSection />
         </div>
 
         <!-- Right Column: Configs and Logs -->
         <div class="space-y-6">
           <ConfigList />
+
           <Settings />
           <LogsPanel v-if="store.showLogs" />
         </div>

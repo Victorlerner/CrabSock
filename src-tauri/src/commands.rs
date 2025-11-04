@@ -12,6 +12,7 @@ use serde::Serialize;
 use tauri::Emitter;
 #[cfg(target_os = "windows")]
 use std::process::Stdio;
+use crate::openvpn::{OpenVpnManager, OpenVpnConfigInfo};
 
 static PROXY_MANAGER: Lazy<Mutex<ProxyManager>> = Lazy::new(|| Mutex::new(ProxyManager::new()));
 static SYSTEM_PROXY_MANAGER: Lazy<Mutex<SystemProxyManager>> = Lazy::new(|| Mutex::new(SystemProxyManager::new()));
@@ -33,6 +34,38 @@ pub struct ConnectionEvent {
     pub status: String,
     pub ip: Option<String>,
     pub country: Option<String>,
+}
+
+// ===================== OpenVPN Commands =====================
+#[tauri::command]
+pub async fn openvpn_list_configs(app: tauri::AppHandle) -> Result<Vec<OpenVpnConfigInfo>, String> {
+    OpenVpnManager::list_configs(&app)
+}
+
+#[tauri::command]
+pub async fn openvpn_add_config(app: tauri::AppHandle, name: String, content: String) -> Result<(), String> {
+    OpenVpnManager::add_config(&app, &name, &content)
+}
+
+#[tauri::command]
+pub async fn openvpn_remove_config(app: tauri::AppHandle, name: String) -> Result<(), String> {
+    OpenVpnManager::remove_config(&app, &name)
+}
+
+#[tauri::command]
+pub async fn openvpn_connect(app: tauri::AppHandle, name: String) -> Result<(), String> {
+    // Do not touch existing sing-box/VLESS/SS flows; run in parallel
+    OpenVpnManager::connect(&app, &name)
+}
+
+#[tauri::command]
+pub async fn openvpn_disconnect(app: tauri::AppHandle) -> Result<(), String> {
+    OpenVpnManager::disconnect(&app)
+}
+
+#[tauri::command]
+pub async fn openvpn_status() -> Result<(bool, bool), String> {
+    Ok(OpenVpnManager::status())
 }
 
 #[tauri::command]
@@ -61,38 +94,14 @@ pub async fn parse_proxy_config(config_string: String) -> Result<ProxyConfig, St
 
 #[tauri::command]
 pub async fn ensure_admin_for_tun() -> Result<bool, String> {
-    #[cfg(target_os = "windows")]
-    {
-        if is_elevated_windows() { return Ok(true); }
-        // Try to relaunch elevated via PowerShell (UAC prompt)
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let exe_str = exe.to_string_lossy().replace('"', "\"");
-        let ps = format!(
-            "Start-Process -FilePath \"{}\" -Verb RunAs -ArgumentList '--set-routing=tun'",
-            exe_str
-        );
-        let status = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &ps])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|e| e.to_string())?;
-        if status.success() {
-            // Advise frontend to let this instance exit; elevated one will start
-            Ok(false)
-        } else {
-            Err("Failed to trigger elevation".into())
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        Ok(true)
-    }
+    // No relaunch. We elevate specific binaries (sing-box/OpenVPN) on-demand.
+    Ok(true)
 }
 
 #[tauri::command]
 pub async fn exit_app(app: tauri::AppHandle) -> Result<(), String> {
+    // Ensure OpenVPN and sing-box are stopped before exiting
+    crate::openvpn::OpenVpnManager::disconnect_silent();
     let _ = app.exit(0);
     Ok(())
 }

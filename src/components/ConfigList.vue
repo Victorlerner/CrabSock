@@ -35,6 +35,13 @@ async function disconnectFromConfig() {
   await store.disconnect()
 }
 
+function confirmRemove(config: any) {
+  const ok = window.confirm('Are you sure you want to delete this configuration?')
+  if (ok) {
+    store.removeConfig(config)
+  }
+}
+
 function getProxyIcon(proxyType: string) {
   switch (proxyType) {
     case 'Shadowsocks':
@@ -135,7 +142,7 @@ function getProxyColor(proxyType: string) {
                 class="px-3 py-1.5 rounded-md bg-yellow-600 text-white cursor-not-allowed transition-all duration-200 flex items-center gap-1.5 text-sm"
                 title="Connecting..."
               >
-                <div class="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+                <span class="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
                 Connecting...
               </button>
               
@@ -155,7 +162,7 @@ function getProxyColor(proxyType: string) {
               
               <!-- Кнопка удаления конфига -->
               <button 
-                @click="store.removeConfig(config)"
+                @click="confirmRemove(config)"
                 class="p-1.5 rounded-md hover:bg-red-100 dark:hover:bg-red-900/30 transition-colors"
                 title="Remove config"
               >

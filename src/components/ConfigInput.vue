@@ -53,7 +53,7 @@ async function apply() {
       id="config-textarea"
       v-model="configText"
       class="w-full h-32 rounded-md border border-gray-300 dark:border-neutral-600 bg-white dark:bg-neutral-900 p-2 font-mono text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500 dark:focus:ring-blue-400 dark:focus:border-blue-400 transition-all duration-200 resize-none"
-      placeholder="ss://, vmess://, or JSON config"
+      placeholder="ss://, vmess://"
     />
     
     <div class="flex justify-between items-center">
@@ -65,7 +65,7 @@ async function apply() {
         :disabled="store.isBusy || !configText.trim()"
         @click="apply"
       >
-        <div v-if="store.isBusy" class="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin"></div>
+        <span v-if="store.isBusy" class="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
         <svg v-else class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path>
         </svg>

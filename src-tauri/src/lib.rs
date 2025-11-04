@@ -15,6 +15,7 @@ pub mod singbox;
 pub mod tun;
 pub mod net;
 pub mod runtime_settings;
+pub mod openvpn;
 
 pub use error::VpnError;
 pub use config::*;
@@ -23,3 +24,4 @@ pub use commands::*;
 pub use config_manager::*;
 pub use system_proxy::*;
 pub use tun_manager::*;
+pub use openvpn::*;
