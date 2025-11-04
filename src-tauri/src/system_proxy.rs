@@ -6,6 +6,10 @@ use std::process::Stdio;
 use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 #[cfg(target_os = "windows")]
 use windows::Win32::Networking::WinInet::{InternetSetOptionW, INTERNET_OPTION_SETTINGS_CHANGED, INTERNET_OPTION_REFRESH};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000; // WinAPI CREATE_NO_WINDOW
 
 #[derive(Debug, Clone)]
 pub struct ProxySettings {
@@ -210,49 +214,59 @@ impl SystemProxyManager {
 
     #[cfg(target_os = "windows")]
     async fn set_windows_system_proxy(&self, settings: &ProxySettings) -> Result<()> {
-        // Windows supports system-wide WinINET proxy for WinINet-aware apps. We'll set:
-        // HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings
+        // Windows: prefer driving traffic through local ACL HTTP proxy (127.0.0.1:8080)
+        // and install a PAC file to DIRECT-bypass private ranges and VPN (Pritunl/WireGuard/TAP) routes.
+        // Keys under: HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings
         //  - ProxyEnable (DWORD)
-        //  - ProxyServer (STRING) in format "socks=host:port" for SOCKS
-        //  - ProxyOverride (STRING)
+        //  - ProxyServer (STRING) e.g. "http=127.0.0.1:8080;https=127.0.0.1:8080"
+        //  - ProxyOverride (STRING) semicolon-separated patterns
+        //  - AutoConfigURL (STRING) to point at PAC file
 
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let path = "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
         let (key, _) = hkcu.create_subkey(path)?;
 
-        if let Some(ref http_proxy) = settings.http_proxy {
-            // Prefer SOCKS5 overall if provided
-            let socks = settings
-                .socks_proxy
-                .as_ref()
-                .or(Some(http_proxy))
-                .cloned()
-                .unwrap();
-            // Normalize to socks=host:port
-            let proxy_str = if let Some(rest) = socks.strip_prefix("socks5://") {
-                format!("socks={}", rest)
-            } else if let Some(rest) = socks.strip_prefix("socks://") {
-                format!("socks={}", rest)
-            } else if let Some(rest) = socks.strip_prefix("http://") {
-                // fallback
-                rest.to_string()
-            } else {
-                format!("socks={}", socks)
-            };
-
+        if settings.http_proxy.is_some() || settings.socks_proxy.is_some() {
+            // Always drive via local ACL HTTP proxy on Windows
+            let proxy_str = "http=127.0.0.1:8080;https=127.0.0.1:8080";
             key.set_value("ProxyEnable", &1u32)?;
             key.set_value("ProxyServer", &proxy_str)?;
 
-            let override_val = settings
+            // Build ProxyOverride from provided no_proxy plus known patterns and optional ACL_BYPASS_HOSTS
+            let mut overrides: Vec<String> = settings
                 .no_proxy
                 .clone()
-                .unwrap_or_else(|| "localhost;127.0.0.1;<local>".to_string())
-                .replace(',', ";");
+                .unwrap_or_else(|| "localhost,127.0.0.1,<local>".to_string())
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            // Ensure <local> present
+            if !overrides.iter().any(|s| s == "<local>") { overrides.push("<local>".to_string()); }
+            // Pritunl-related domains
+            overrides.push("*.pritunl.*".to_string());
+            // User-provided extra bypass via env ACL_BYPASS_HOSTS -> wildcard
+            if let Ok(extra) = std::env::var("ACL_BYPASS_HOSTS") {
+                for p in extra.split(',') {
+                    let p = p.trim(); if p.is_empty() { continue; }
+                    // wrap with wildcards if domain-like
+                    if p.contains('.') && !p.contains('*') { overrides.push(format!("*.{}", p.trim_start_matches("*.").trim_end_matches("."))); }
+                    else { overrides.push(p.to_string()); }
+                }
+            }
+            let override_val = overrides.join(";");
             key.set_value("ProxyOverride", &override_val)?;
+
+            // Install PAC to dynamically DIRECT-bypass VPN routes
+            if let Some(pac_path) = Self::write_windows_pac("127.0.0.1", 8080) {
+                key.set_value("AutoConfigURL", &format!("file://{}", pac_path))?;
+            }
         } else {
             // disable proxy
             key.set_value("ProxyEnable", &0u32)?;
             let _ = key.delete_value("ProxyServer");
+            let _ = key.delete_value("ProxyOverride");
+            let _ = key.delete_value("AutoConfigURL");
         }
 
         // Notify system
@@ -262,6 +276,113 @@ impl SystemProxyManager {
         }
 
         Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    fn write_windows_pac(http_host: &str, http_port: u16) -> Option<String> {
+        use std::fs;
+        use std::io::Write;
+        use std::path::PathBuf;
+        use std::process::Command;
+
+        let mut dir = dirs::data_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        dir.push("CrabSock");
+        let _ = fs::create_dir_all(&dir);
+        let mut pac_path = PathBuf::from(&dir);
+        pac_path.push("proxy.pac");
+
+        // Collect IPv4 destination prefixes routed via VPN-like interfaces
+        let mut dynamic_routes: Vec<(String, String)> = Vec::new();
+        let ps = r#"
+            try {
+              $routes = Get-NetRoute -AddressFamily IPv4 | Sort-Object -Property RouteMetric
+              foreach ($r in $routes) {
+                $alias = (Get-NetIPInterface -ifIndex $r.ifIndex -AddressFamily IPv4).InterfaceAlias
+                if ($alias -match 'pritunl|wireguard|wintun|tap|openvpn') {
+                  $dest = $r.DestinationPrefix # e.g. 10.0.0.0/24
+                  Write-Output $dest
+                }
+              }
+            } catch {}
+        "#;
+        if let Ok(out) = Command::new("powershell")
+            .args(["-NoProfile", "-Command", ps])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output() {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                for line in text.lines() {
+                    let s = line.trim(); if s.is_empty() { continue; }
+                    if let Some((addr, prefix_str)) = s.split_once('/') {
+                        if let Ok(prefix) = prefix_str.parse::<u8>() {
+                            let mask_u32: u32 = if prefix == 0 { 0 } else { (!0u32) << (32 - prefix as u32) };
+                            let mask = format!("{}.{}.{}.{}",
+                                (mask_u32 >> 24) & 0xff,
+                                (mask_u32 >> 16) & 0xff,
+                                (mask_u32 >> 8) & 0xff,
+                                mask_u32 & 0xff);
+                            dynamic_routes.push((addr.to_string(), mask));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut pac = format!(r#"function FindProxyForURL(url, host) {{
+  if (isPlainHostName(host) ||
+      isInNet(host, '10.0.0.0', '255.0.0.0') ||
+      isInNet(host, '100.64.0.0', '255.192.0.0') ||
+      isInNet(host, '169.254.0.0', '255.255.0.0') ||
+      isInNet(host, '172.16.0.0', '255.240.0.0') ||
+      isInNet(host, '192.0.0.0', '255.255.255.0') ||
+      isInNet(host, '192.0.2.0', '255.255.255.0') ||
+      isInNet(host, '192.31.196.0', '255.255.255.0') ||
+      isInNet(host, '192.52.193.0', '255.255.255.0') ||
+      isInNet(host, '192.88.99.0', '255.255.255.0') ||
+      isInNet(host, '192.168.0.0', '255.255.0.0') ||
+      isInNet(host, '192.175.48.0', '255.255.255.0') ||
+      isInNet(host, '198.18.0.0', '255.254.0.0') ||
+      isInNet(host, '198.51.100.0', '255.255.255.0') ||
+      isInNet(host, '203.0.113.0', '255.255.255.0') ||
+      isInNet(host, '240.0.0.0', '240.0.0.0')) {{
+    return 'DIRECT';
+  }}
+  return 'PROXY {0}:{1}';
+}}
+"#, http_host, http_port);
+
+        if !dynamic_routes.is_empty() {
+            let mut extra = String::new();
+            extra.push_str("// dynamic routes via VPN on Windows\nfunction __bypassDynamic(host) {\n");
+            extra.push_str("  if (\n");
+            for (i, (addr, mask)) in dynamic_routes.iter().enumerate() {
+                if i > 0 { extra.push_str("      || "); } else { extra.push_str("      "); }
+                extra.push_str(&format!("isInNet(host, '{}', '{}')\n", addr, mask));
+            }
+            extra.push_str("  ) { return 'DIRECT'; }\n  return null;\n}\n\n");
+            let wrapped = format!(
+                r#"{extra}
+function FindProxyForURL(url, host) {{
+  var d = __bypassDynamic(host);
+  if (d) return d;
+  return ({main})(url, host);
+}}
+"#,
+                extra = extra,
+                main = "FindProxyForURL"
+            );
+            pac.push_str(&wrapped);
+        }
+
+        if let Ok(mut f) = fs::File::create(&pac_path) {
+            if f.write_all(pac.as_bytes()).is_ok() {
+                return Some(pac_path.to_string_lossy().into_owned());
+            }
+        }
+        None
     }
 
     #[cfg(target_os = "macos")]

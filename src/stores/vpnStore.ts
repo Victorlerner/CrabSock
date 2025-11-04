@@ -20,6 +20,12 @@ interface ParsedConfig {
   alpn?: string[]
   ws_path?: string
   ws_headers?: Record<string, string>
+  // VLESS / REALITY extras
+  flow?: string
+  fingerprint?: string // fp
+  reality_public_key?: string // pbk
+  reality_short_id?: string // sid
+  reality_spx?: string // spx
 }
 
 interface LogEntry {
@@ -61,6 +67,7 @@ export const useVpnStore = defineStore('vpn', {
       tun_mode: false,
     },
     configPath: '',
+    routingMode: 'systemproxy' as 'systemproxy' | 'tun',
   }),
   actions: {
     addLog(level: 'info' | 'warn' | 'error', message: string, source: 'frontend' | 'backend' = 'frontend') {
@@ -99,6 +106,15 @@ export const useVpnStore = defineStore('vpn', {
         this.addLog('info', `Config path: ${this.configPath}`, 'frontend')
       } catch (e) {
         this.addLog('error', `Failed to load configs: ${e}`, 'frontend')
+      }
+
+      // Load routing mode from backend settings
+      try {
+        const settings = await invoke('get_settings') as { routing_mode?: string }
+        const mode = (settings?.routing_mode || 'SystemProxy').toString().toLowerCase()
+        this.routingMode = mode === 'tun' ? 'tun' : 'systemproxy'
+      } catch (e) {
+        // ignore, keep default
       }
 
       // Listen for backend status events
@@ -182,7 +198,17 @@ export const useVpnStore = defineStore('vpn', {
         this.addLog('error', `Failed to save settings: ${e}`, 'frontend')
       })
     },
-    
+
+    async setRoutingMode(mode: 'systemproxy' | 'tun') {
+      try {
+        await invoke('set_routing_mode', { mode })
+        this.routingMode = mode
+        this.addLog('info', `Routing mode set to ${mode}`, 'frontend')
+      } catch (e) {
+        this.addLog('error', `Failed to set routing mode: ${e}`, 'frontend')
+      }
+    },
+
     async applyConfig() {
       if (!this.rawConfig.trim()) {
         this.setError('Config cannot be empty')
@@ -381,6 +407,33 @@ export const useVpnStore = defineStore('vpn', {
         }
         const encoded = btoa(JSON.stringify(vmessConfig))
         return `vmess://${encoded}`
+      } else if (config.proxy_type === 'VLESS') {
+        const uuid = config.uuid || ''
+        const qs = new URLSearchParams()
+        // VLESS requires encryption=none when using TLS/WS
+        qs.set('encryption', 'none')
+        if (config.security === 'reality') {
+          qs.set('security', 'reality')
+          if (config.reality_public_key) qs.set('pbk', config.reality_public_key)
+          if (config.reality_short_id) qs.set('sid', config.reality_short_id)
+          if (config.reality_spx) qs.set('spx', config.reality_spx)
+          if (config.fingerprint) qs.set('fp', config.fingerprint)
+          if (config.flow) qs.set('flow', config.flow)
+        } else if (config.tls) {
+          qs.set('security', 'tls')
+        }
+        if (config.sni) qs.set('sni', config.sni)
+        if (config.alpn && config.alpn.length) qs.set('alpn', config.alpn.join(','))
+        const net = config.network || 'tcp'
+        qs.set('type', net)
+        if (net === 'ws') {
+          if (config.ws_path) qs.set('path', config.ws_path)
+          const hostHeader = config.ws_headers?.Host || config.sni
+          if (hostHeader) qs.set('host', hostHeader)
+        }
+        if (config.skip_cert_verify) qs.set('allowInsecure', '1')
+        const tag = encodeURIComponent(config.name || `${config.server}:${config.port}`)
+        return `vless://${uuid}@${config.server}:${config.port}?${qs.toString()}#${tag}`
       }
       return JSON.stringify(config)
     },

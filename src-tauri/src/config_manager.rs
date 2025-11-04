@@ -7,15 +7,22 @@ use anyhow::Result;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigFile {
     pub configs: Vec<ProxyConfig>,
+    #[serde(default)]
     pub settings: AppSettings,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RoutingMode { SystemProxy, Tun }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AppSettings {}
+#[serde(default)]
+pub struct AppSettings {
+    pub routing_mode: RoutingMode,
+}
 
 impl Default for AppSettings {
     fn default() -> Self {
-        Self {}
+        Self { routing_mode: RoutingMode::SystemProxy }
     }
 }
 

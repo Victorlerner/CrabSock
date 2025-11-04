@@ -36,6 +36,23 @@ fn main() {
     init_logging();
     log::info!("[MAIN] Starting CrabSock Tauri app");
 
+    // Parse CLI overrides (e.g., from elevation relaunch)
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(arg) = args.iter().find(|a| a.starts_with("--set-routing=")) {
+            let val = arg.trim_start_matches("--set-routing=").to_lowercase();
+            tauri::async_runtime::block_on(async {
+                if let Ok(manager) = ConfigManager::new() {
+                    if let Ok(mut file) = manager.load_configs().await {
+                        file.settings.routing_mode = if val == "tun" { crab_sock::config_manager::RoutingMode::Tun } else { crab_sock::config_manager::RoutingMode::SystemProxy };
+                        let _ = manager.save_configs(&file).await;
+                        log::info!("[MAIN] Routing mode overridden by CLI: {}", val);
+                    }
+                }
+            });
+        }
+    }
+
     #[cfg(target_os = "linux")]
     {
         let is_debug = cfg!(debug_assertions);
@@ -61,7 +78,7 @@ fn main() {
     }
 
     // Инициализируем конфиги при старте приложения
-    tokio::runtime::Runtime::new().unwrap().block_on(async {
+    tauri::async_runtime::block_on(async {
         match ConfigManager::new() {
             Ok(config_manager) => {
                 match config_manager.load_configs().await {
@@ -78,6 +95,23 @@ fn main() {
             }
         }
     });
+
+    // Handle Ctrl+C / console close to gracefully tear down external processes
+    {
+        let _ = ctrlc::set_handler(|| {
+            // Fire-and-forget: best effort cleanup without creating a new runtime
+            std::thread::spawn(|| {
+                tauri::async_runtime::spawn(async {
+                    crab_sock::commands::disconnect_vpn_silent().await;
+                    let _ = crab_sock::commands::disable_tun_mode().await;
+                    let _ = crab_sock::commands::clear_system_proxy().await;
+                });
+                // Give the async tasks a moment, then exit
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                std::process::exit(0);
+            });
+        });
+    }
 
     tauri::Builder::default()
         .setup(|app| {
@@ -117,9 +151,12 @@ fn main() {
                             }
                         }
                         "quit" => {
-                            // Грейсфул-шатдаун: отключаем TUN и чистим системный прокси перед выходом
+                            // Грейсфул-шатдаун: сначала останавливаем прокси (убьёт sing-box), затем TUN и системный прокси
                             let app = icon.app_handle().clone();
                             tauri::async_runtime::spawn(async move {
+                                // Stop proxy first (kills sing-box if running)
+                                disconnect_vpn_silent().await;
+                                // Then tear down TUN and system proxy
                                 let _ = disable_tun_mode().await;
                                 let _ = clear_system_proxy().await;
                                 let _ = app.exit(0);
@@ -140,6 +177,8 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             parse_proxy_config,
+            ensure_admin_for_tun,
+            exit_app,
             connect_vpn,
             disconnect_vpn,
             get_status,
@@ -149,6 +188,8 @@ fn main() {
             save_config,
             remove_config,
             get_config_path,
+            get_settings,
+            set_routing_mode,
             set_system_proxy,
             clear_system_proxy,
             enable_tun_mode,

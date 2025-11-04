@@ -6,6 +6,7 @@ import LoadingSpinner from '@src/components/LoadingSpinner.vue'
 import ConfigList from '@src/components/ConfigList.vue'
 import LogsPanel from '@src/components/LogsPanel.vue'
 import ConnectionStatus from '@src/components/ConnectionStatus.vue'
+import Settings from '@src/components/Settings.vue'
 import { onMounted } from 'vue'
 import { useVpnStore } from '@src/stores/vpnStore'
 
@@ -15,7 +16,7 @@ onMounted(() => store.init())
 
 <template>
   <div class="min-h-full bg-gray-50 dark:bg-neutral-900 text-gray-900 dark:text-gray-100">
-    <div class="mx-auto max-w-4xl p-6 space-y-6">
+    <div class="mx-auto p-6 space-y-6">
       <header class="flex items-center justify-between">
         <img src="/app-icon.png" alt="App icon" class="w-16 h-16" />
         <div class="flex items-center gap-2">
@@ -53,6 +54,7 @@ onMounted(() => store.init())
         <!-- Right Column: Configs and Logs -->
         <div class="space-y-6">
           <ConfigList />
+          <Settings />
           <LogsPanel v-if="store.showLogs" />
         </div>
       </div>
