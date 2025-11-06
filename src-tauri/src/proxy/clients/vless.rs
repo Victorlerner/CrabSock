@@ -74,6 +74,7 @@ impl Drop for VlessClient {
             {
                 if let Some(pid) = child.id() {
                     let _ = std::process::Command::new("taskkill")
+                        .creation_flags(0x08000000)
                         .args(["/PID", &pid.to_string(), "/T", "/F"]) 
                         .stdin(std::process::Stdio::null())
                         .stdout(std::process::Stdio::null())
@@ -142,6 +143,7 @@ impl ProxyClient for VlessClient {
                 if let Some(pid) = child.id() {
                     use tokio::process::Command as TokioCommand;
                     let _ = TokioCommand::new("taskkill")
+                        .creation_flags(0x08000000)
                         .args(["/PID", &pid.to_string(), "/T", "/F"]) 
                         .stdin(std::process::Stdio::null())
                         .stdout(std::process::Stdio::null())

@@ -7,6 +7,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use std::collections::VecDeque;
 use tauri::AppHandle;
 use tauri::Manager;
 use tauri::Emitter;
@@ -37,6 +38,30 @@ pub struct OpenVpnManager {
 }
 
 static GLOBAL_MGR: Lazy<Arc<Mutex<OpenVpnManager>>> = Lazy::new(|| Arc::new(Mutex::new(OpenVpnManager::default())));
+
+// In-memory ring buffer for recent OpenVPN logs (for replay after frontend reload/start)
+const LOG_BUFFER_CAP: usize = 500;
+static LOG_BUFFER: Lazy<Mutex<VecDeque<String>>> = Lazy::new(|| Mutex::new(VecDeque::with_capacity(LOG_BUFFER_CAP)));
+
+fn buffer_log(line: &str) {
+    let mut q = LOG_BUFFER.lock().unwrap();
+    if q.len() >= LOG_BUFFER_CAP { let _ = q.pop_front(); }
+    q.push_back(line.to_string());
+}
+
+// Track last known status for frontend to query on (re)start
+static LAST_STATUS: Lazy<Mutex<OpenVpnStatusEvent>> = Lazy::new(|| Mutex::new(OpenVpnStatusEvent { status: "disconnected".into(), detail: None }));
+
+pub fn get_recent_logs(limit: usize) -> Vec<String> {
+    let q = LOG_BUFFER.lock().unwrap();
+    let n = limit.min(q.len());
+    // return in original order
+    q.iter().rev().take(n).cloned().collect::<Vec<_>>().into_iter().rev().collect()
+}
+
+pub fn current_status_event() -> OpenVpnStatusEvent {
+    LAST_STATUS.lock().unwrap().clone()
+}
 
 impl OpenVpnManager {
     pub fn global() -> Arc<Mutex<OpenVpnManager>> {
@@ -267,51 +292,28 @@ impl OpenVpnManager {
         #[cfg(not(target_os = "windows"))]
         let args_with_log = args.clone();
 
-        // Spawn process (Windows: elevate if needed)
+        // Spawn process (Windows: require app to be elevated; do not self-elevate OpenVPN)
         #[cfg(target_os = "windows")]
         let mut child: Option<Child> = {
             if !is_elevated_windows_local() {
-                // Elevate via PowerShell; we won't have a child handle, tail the log instead
-                let joined = args_with_log
-                    .iter()
-                    .map(|s| s.replace("'", "''"))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let ps = format!(
-                    "Start-Process -FilePath \"{}\" -Verb RunAs -WindowStyle Hidden -ArgumentList '{}'",
-                    exe.display(),
-                    joined
-                );
-                let mut psc = std::process::Command::new("powershell");
-                #[cfg(target_os = "windows")]
-                { use std::os::windows::process::CommandExt; psc.creation_flags(0x08000000); }
-                let status = psc
-                    .args(["-NoProfile","-NonInteractive","-WindowStyle","Hidden","-Command", &ps])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .map_err(|e| format!("Failed to elevate OpenVPN: {}", e))?;
-                log::debug!("[OPENVPN] Elevated launch status: {}", status);
-                None
-            } else {
-                let mut cmd = Command::new(&exe);
-                cmd.args(&args_with_log)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped());
-                // Hide console window for non-elevated run
-                #[cfg(target_os = "windows")]
-                {
-                    use std::os::windows::process::CommandExt;
-                    const CREATE_NO_WINDOW: u32 = 0x08000000;
-                    cmd.creation_flags(CREATE_NO_WINDOW);
-                }
-                if !work_dir.as_os_str().is_empty() { cmd.current_dir(&work_dir); }
-                let ch = cmd.spawn().map_err(|e| format!("Failed to start OpenVPN: {}", e))?;
-                log::debug!("[OPENVPN] PID: {}", ch.id());
-                Some(ch)
+                return Err("OpenVPN requires Administrator privileges. Please restart the app as Administrator.".into());
             }
+            let mut cmd = Command::new(&exe);
+            cmd.args(&args_with_log)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            // Hide console window for run
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x08000000;
+                cmd.creation_flags(CREATE_NO_WINDOW);
+            }
+            if !work_dir.as_os_str().is_empty() { cmd.current_dir(&work_dir); }
+            let ch = cmd.spawn().map_err(|e| format!("Failed to start OpenVPN: {}", e))?;
+            log::debug!("[OPENVPN] PID: {}", ch.id());
+            Some(ch)
         };
         #[cfg(not(target_os = "windows"))]
         let mut child: Option<Child> = {
@@ -337,14 +339,7 @@ impl OpenVpnManager {
         thread::spawn(move || {
             if let Some(err) = stderr { read_and_emit_logs(err, &app_handle2); }
         });
-        // Tail log file only for elevated Windows run (we don't own the child stdout)
-        #[cfg(target_os = "windows")]
-        if child.is_none() {
-            let app_tail = app.clone();
-            thread::spawn(move || {
-                tail_log_file(&log_path, &app_tail);
-            });
-        }
+        // Tail log file path was used when elevating OpenVPN itself; no longer needed.
 
         // Persist state
         {
@@ -360,10 +355,12 @@ impl OpenVpnManager {
         }
 
         // Emit initial status, then watch for connected line in logs
-        let win_conn_opt = app.get_webview_window("main");
-        if let Some(win) = win_conn_opt {
-            let _ = win.emit("openvpn-status", OpenVpnStatusEvent { status: "connecting".into(), detail: None });
-        }
+        let evt = OpenVpnStatusEvent { status: "connecting".into(), detail: None };
+        if let Ok(mut s) = LAST_STATUS.lock() { *s = evt.clone(); }
+        // emit to all windows
+        for (_, win) in app.webview_windows() { let _ = win.emit("openvpn-status", evt.clone()); }
+        // also try app-scope emit if available
+        let _ = app.emit("openvpn-status", evt);
         log::debug!("[OPENVPN] Status -> connecting");
 
         // Background watcher to infer connected by scanning temp log file via events
@@ -401,10 +398,10 @@ impl OpenVpnManager {
         g.disconnect_internal();
         drop(g);
         if had {
-            let win_disc_opt = app.get_webview_window("main");
-            if let Some(win) = win_disc_opt {
-                let _ = win.emit("openvpn-status", OpenVpnStatusEvent { status: "disconnected".into(), detail: None });
-            }
+            let evt = OpenVpnStatusEvent { status: "disconnected".into(), detail: None };
+            if let Ok(mut s) = LAST_STATUS.lock() { *s = evt.clone(); }
+            for (_, win) in app.webview_windows() { let _ = win.emit("openvpn-status", evt.clone()); }
+            let _ = app.emit("openvpn-status", evt);
             log::debug!("[OPENVPN] Status -> disconnected");
         }
         Ok(())
@@ -469,12 +466,15 @@ impl OpenVpnManager {
 fn read_and_emit_logs<R: std::io::Read + Send + 'static>(reader: R, app: &AppHandle) {
     let buf = BufReader::new(reader);
     for line in buf.lines().flatten() {
+        buffer_log(&line);
         log::debug!("[OPENVPN][OUT] {}", line);
-        let win_log_opt = app.get_webview_window("main");
-        if let Some(win) = win_log_opt { let _ = win.emit("openvpn-log", line.clone()); }
+        for (_, win) in app.webview_windows() { let _ = win.emit("openvpn-log", line.clone()); }
+        let _ = app.emit("openvpn-log", line.clone());
         if line.contains("Initialization Sequence Completed") {
-            let win_ok_opt = app.get_webview_window("main");
-            if let Some(win) = win_ok_opt { let _ = win.emit("openvpn-status", OpenVpnStatusEvent { status: "connected".into(), detail: None }); }
+            let evt = OpenVpnStatusEvent { status: "connected".into(), detail: None };
+            if let Ok(mut s) = LAST_STATUS.lock() { *s = evt.clone(); }
+            for (_, win) in app.webview_windows() { let _ = win.emit("openvpn-status", evt.clone()); }
+            let _ = app.emit("openvpn-status", evt);
             log::debug!("[OPENVPN] Status -> connected (init complete)");
             if let Ok(mut g) = OpenVpnManager::global().lock() { g.connected = true; }
         }
@@ -498,10 +498,16 @@ fn tail_log_file(path: &Path, app: &AppHandle) {
         for line in buf.lines() {
             let line = line.trim();
             if line.is_empty() { continue; }
+            buffer_log(line);
             log::debug!("[OPENVPN][LOG] {}", line);
-            if let Some(win) = app.get_webview_window("main") { let _ = win.emit("openvpn-log", line.to_string()); }
+            let msg = line.to_string();
+            for (_, win) in app.webview_windows() { let _ = win.emit("openvpn-log", msg.clone()); }
+            let _ = app.emit("openvpn-log", msg);
             if line.contains("Initialization Sequence Completed") {
-                if let Some(win) = app.get_webview_window("main") { let _ = win.emit("openvpn-status", OpenVpnStatusEvent { status: "connected".into(), detail: None }); }
+                let evt = OpenVpnStatusEvent { status: "connected".into(), detail: None };
+                if let Ok(mut s) = LAST_STATUS.lock() { *s = evt.clone(); }
+                for (_, win) in app.webview_windows() { let _ = win.emit("openvpn-status", evt.clone()); }
+                let _ = app.emit("openvpn-status", evt);
                 if let Ok(mut g) = OpenVpnManager::global().lock() { g.connected = true; }
             }
         }

@@ -14,7 +14,32 @@ use tauri::Emitter;
 use std::process::Stdio;
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 use crate::openvpn::{OpenVpnManager, OpenVpnConfigInfo};
+#[cfg(target_os = "windows")]
+use crate::openvpn;
+
+#[cfg(target_os = "windows")]
+fn relaunch_elevated_with_args(args: &[&str]) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe_str = exe.to_string_lossy().replace('"', "\"");
+    // Join args with spaces; escape single quotes for PowerShell string literal
+    let joined = args.iter().map(|a| a.replace("'", "''")).collect::<Vec<_>>().join(" ");
+    let ps = format!(
+        "Start-Process -FilePath \"{}\" -Verb RunAs -WindowStyle Hidden -ArgumentList '{}'",
+        exe_str, joined
+    );
+    let status = std::process::Command::new("powershell")
+        .creation_flags(CREATE_NO_WINDOW)
+        .args(["-NoProfile","-NonInteractive","-WindowStyle","Hidden","-Command", &ps])
+        .stdin(Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| e.to_string())?;
+    if status.success() { Ok(()) } else { Err("Failed to trigger elevation".into()) }
+}
 
 static PROXY_MANAGER: Lazy<Mutex<ProxyManager>> = Lazy::new(|| Mutex::new(ProxyManager::new()));
 static SYSTEM_PROXY_MANAGER: Lazy<Mutex<SystemProxyManager>> = Lazy::new(|| Mutex::new(SystemProxyManager::new()));
@@ -56,7 +81,17 @@ pub async fn openvpn_remove_config(app: tauri::AppHandle, name: String) -> Resul
 
 #[tauri::command]
 pub async fn openvpn_connect(app: tauri::AppHandle, name: String) -> Result<(), String> {
-    // Do not touch existing sing-box/VLESS/SS flows; run in parallel
+    // On Windows: ensure the whole app is elevated, do not elevate openvpn.exe directly
+    #[cfg(target_os = "windows")]
+    {
+        if !is_elevated_windows() {
+            let arg = format!(r#"--openvpn-connect="{}""#, name.replace('"', "\""));
+            relaunch_elevated_with_args(&["--elevated-relaunch", &arg])?;
+            let _ = app.exit(0);
+            return Ok(());
+        }
+    }
+
     OpenVpnManager::connect(&app, &name)
 }
 
@@ -68,6 +103,17 @@ pub async fn openvpn_disconnect(app: tauri::AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub async fn openvpn_status() -> Result<(bool, bool), String> {
     Ok(OpenVpnManager::status())
+}
+
+// === OpenVPN log/status helpers for frontend replay ===
+#[tauri::command]
+pub async fn openvpn_get_recent_logs(limit: usize) -> Result<Vec<String>, String> {
+    Ok(openvpn::get_recent_logs(limit))
+}
+
+#[tauri::command]
+pub async fn openvpn_current_status() -> Result<openvpn::OpenVpnStatusEvent, String> {
+    Ok(openvpn::current_status_event())
 }
 
 #[tauri::command]
@@ -99,26 +145,10 @@ pub async fn ensure_admin_for_tun() -> Result<bool, String> {
     #[cfg(target_os = "windows")]
     {
         if is_elevated_windows() { return Ok(true); }
-        // Try to relaunch elevated via PowerShell (UAC prompt)
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let exe_str = exe.to_string_lossy().replace('"', "\"");
-        let ps = format!(
-            "Start-Process -FilePath \"{}\" -Verb RunAs -ArgumentList '--set-routing=tun'",
-            exe_str
-        );
-        let status = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", &ps])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|e| e.to_string())?;
-        if status.success() {
-            // Advise frontend to let this instance exit; elevated one will start
-            Ok(false)
-        } else {
-            Err("Failed to trigger elevation".into())
-        }
+        // Relaunch elevated via shared helper (single UAC prompt)
+        relaunch_elevated_with_args(&["--elevated-relaunch", "--set-routing=tun"])?;
+        // Advise frontend to let this instance exit; elevated one will start
+        Ok(false)
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -139,6 +169,7 @@ pub async fn exit_app(app: tauri::AppHandle) -> Result<(), String> {
 fn is_elevated_windows() -> bool {
     // Use PowerShell to check admin group membership to avoid Win32 FFI
     let out = std::process::Command::new("powershell")
+        .creation_flags(CREATE_NO_WINDOW)
         .args([
             "-NoProfile",
             "-NonInteractive",
