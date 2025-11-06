@@ -12,6 +12,9 @@ use serde::Serialize;
 use tauri::Emitter;
 #[cfg(target_os = "windows")]
 use std::process::Stdio;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+use crate::openvpn::{OpenVpnManager, OpenVpnConfigInfo};
 
 static PROXY_MANAGER: Lazy<Mutex<ProxyManager>> = Lazy::new(|| Mutex::new(ProxyManager::new()));
 static SYSTEM_PROXY_MANAGER: Lazy<Mutex<SystemProxyManager>> = Lazy::new(|| Mutex::new(SystemProxyManager::new()));
@@ -33,6 +36,38 @@ pub struct ConnectionEvent {
     pub status: String,
     pub ip: Option<String>,
     pub country: Option<String>,
+}
+
+// ===================== OpenVPN Commands =====================
+#[tauri::command]
+pub async fn openvpn_list_configs(app: tauri::AppHandle) -> Result<Vec<OpenVpnConfigInfo>, String> {
+    OpenVpnManager::list_configs(&app)
+}
+
+#[tauri::command]
+pub async fn openvpn_add_config(app: tauri::AppHandle, name: String, content: String) -> Result<(), String> {
+    OpenVpnManager::add_config(&app, &name, &content)
+}
+
+#[tauri::command]
+pub async fn openvpn_remove_config(app: tauri::AppHandle, name: String) -> Result<(), String> {
+    OpenVpnManager::remove_config(&app, &name)
+}
+
+#[tauri::command]
+pub async fn openvpn_connect(app: tauri::AppHandle, name: String) -> Result<(), String> {
+    // Do not touch existing sing-box/VLESS/SS flows; run in parallel
+    OpenVpnManager::connect(&app, &name)
+}
+
+#[tauri::command]
+pub async fn openvpn_disconnect(app: tauri::AppHandle) -> Result<(), String> {
+    OpenVpnManager::disconnect(&app)
+}
+
+#[tauri::command]
+pub async fn openvpn_status() -> Result<(bool, bool), String> {
+    Ok(OpenVpnManager::status())
 }
 
 #[tauri::command]
@@ -91,8 +126,11 @@ pub async fn ensure_admin_for_tun() -> Result<bool, String> {
     }
 }
 
+
 #[tauri::command]
 pub async fn exit_app(app: tauri::AppHandle) -> Result<(), String> {
+    // Ensure OpenVPN and sing-box are stopped before exiting
+    crate::openvpn::OpenVpnManager::disconnect_silent();
     let _ = app.exit(0);
     Ok(())
 }

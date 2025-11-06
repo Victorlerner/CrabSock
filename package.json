@@ -12,7 +12,7 @@
     "icons:all": "npm run icons:desktop && npm run icons:web",
     "tauri:dev": "tauri dev",
     "tauri:dev:linux": "WEBKIT_DISABLE_DMABUF_RENDERER=1  tauri dev",
-    "tauri:build": " npm run icons:all && tauri build",
+    "tauri:build": " npm run icons:all && tauri build -- -j 8",
     "tauri:build:linux": "WEBKIT_DISABLE_DMABUF_RENDERER=1  npm run icons:all && tauri build",
     "arch:build": "cd arch && makepkg -si --noconfirm"
   },
