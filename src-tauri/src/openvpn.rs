@@ -279,17 +279,7 @@ impl OpenVpnManager {
             }
         }
 
-        // Prepare unified log file and add --log for elevated run
-        let log_path = tmp_dir.join(format!("{}-openvpn.log", name));
-        let log_path_str = log_path.to_string_lossy().to_string();
-        #[cfg(target_os = "windows")]
-        let args_with_log = {
-            let mut v = args.clone();
-            v.push("--log".into());
-            v.push(log_path_str.clone());
-            v
-        };
-        #[cfg(not(target_os = "windows"))]
+        // Use stdout for logs; avoid redirecting to file so frontend receives live logs
         let args_with_log = args.clone();
 
         // Spawn process (Windows: require app to be elevated; do not self-elevate OpenVPN)
@@ -377,10 +367,10 @@ impl OpenVpnManager {
                 }
             }
             if alive {
-                let win_connected_opt = app_handle3.get_webview_window("main");
-                if let Some(win) = win_connected_opt {
-                    let _ = win.emit("openvpn-status", OpenVpnStatusEvent { status: "connected".into(), detail: None });
-                }
+                let evt = OpenVpnStatusEvent { status: "connected".into(), detail: None };
+                if let Ok(mut s) = LAST_STATUS.lock() { *s = evt.clone(); }
+                for (_, win) in app_handle3.webview_windows() { let _ = win.emit("openvpn-status", evt.clone()); }
+                let _ = app_handle3.emit("openvpn-status", evt);
                 log::debug!("[OPENVPN] Status -> connected (alive)");
                 let global2 = OpenVpnManager::global();
                 let mut g = global2.lock().unwrap();
