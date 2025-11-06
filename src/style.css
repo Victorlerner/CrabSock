@@ -3,3 +3,26 @@
 /* App mounting container sizing */
 html, body, #app { height: 100%; }
 body { margin: 0; }
+
+/* Pretty scrollbars for logs (light/dark) */
+.nice-scroll {
+  scrollbar-width: thin; /* Firefox */
+  scrollbar-color: rgba(100,116,139,0.45) transparent;
+}
+.dark .nice-scroll {
+  scrollbar-color: rgba(148,163,184,0.35) transparent;
+}
+.nice-scroll::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.nice-scroll::-webkit-scrollbar-thumb {
+  background-color: rgba(100,116,139,0.45); /* slate-500/45 */
+  border-radius: 9999px;
+}
+.dark .nice-scroll::-webkit-scrollbar-thumb {
+  background-color: rgba(148,163,184,0.35); /* slate-300/35 */
+}
+.nice-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
