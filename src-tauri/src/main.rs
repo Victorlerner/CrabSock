@@ -103,6 +103,8 @@ fn main() {
             std::thread::spawn(|| {
                 tauri::async_runtime::spawn(async {
                     crab_sock::commands::disconnect_vpn_silent().await;
+                    // Stop OpenVPN if running (silent, no UI events)
+                    crab_sock::openvpn::OpenVpnManager::disconnect_silent();
                     let _ = crab_sock::commands::disable_tun_mode().await;
                     let _ = crab_sock::commands::clear_system_proxy().await;
                 });
@@ -156,6 +158,8 @@ fn main() {
                             tauri::async_runtime::spawn(async move {
                                 // Stop proxy first (kills sing-box if running)
                                 disconnect_vpn_silent().await;
+                                // Stop OpenVPN if running
+                                crab_sock::openvpn::OpenVpnManager::disconnect_silent();
                                 // Then tear down TUN and system proxy
                                 let _ = disable_tun_mode().await;
                                 let _ = clear_system_proxy().await;
@@ -194,7 +198,14 @@ fn main() {
             clear_system_proxy,
             enable_tun_mode,
             disable_tun_mode,
-            is_tun_mode_enabled
+            is_tun_mode_enabled,
+            // OpenVPN
+            openvpn_list_configs,
+            openvpn_add_config,
+            openvpn_remove_config,
+            openvpn_connect,
+            openvpn_disconnect,
+            openvpn_status
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri app");
