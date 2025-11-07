@@ -3,9 +3,11 @@
 use crab_sock::commands::*;
 use crab_sock::utils::init_logging;
 use crab_sock::config_manager::ConfigManager;
+use crab_sock::openvpn::OpenVpnManager;
 #[cfg(target_os = "linux")]
 use crab_sock::linux_capabilities::{has_cap_net_admin, set_cap_net_admin_via_pkexec, set_cap_net_admin_via_sudo};
 use tauri::Manager;
+use tauri::Emitter;
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
 use tauri::menu::{Menu, MenuItem};
 
@@ -37,10 +39,15 @@ fn main() {
     log::info!("[MAIN] Starting CrabSock Tauri app");
 
     // Parse CLI overrides (e.g., from elevation relaunch)
+    // Parse CLI overrides (e.g., from elevation relaunch)
+    let mut auto_ovpn: Option<String> = None;
+    let mut elevated_relaunch: bool = false;
+    let mut routing_override: Option<String> = None;
     {
         let args: Vec<String> = std::env::args().collect();
         if let Some(arg) = args.iter().find(|a| a.starts_with("--set-routing=")) {
             let val = arg.trim_start_matches("--set-routing=").to_lowercase();
+            routing_override = Some(val.clone());
             tauri::async_runtime::block_on(async {
                 if let Ok(manager) = ConfigManager::new() {
                     if let Ok(mut file) = manager.load_configs().await {
@@ -50,6 +57,13 @@ fn main() {
                     }
                 }
             });
+        }
+        if let Some(arg) = args.iter().find(|a| a.starts_with("--openvpn-connect=")) {
+            let val = arg.trim_start_matches("--openvpn-connect=").trim_matches('"').to_string();
+            auto_ovpn = Some(val);
+        }
+        if args.iter().any(|a| a == "--elevated-relaunch") {
+            elevated_relaunch = true;
         }
     }
 
@@ -116,7 +130,7 @@ fn main() {
     }
 
     tauri::Builder::default()
-        .setup(|app| {
+        .setup(move |app| {
             // Создаем трей-иконку и обрабатываем клики для показа окна
             let icon = app.default_window_icon().cloned().expect("default window icon missing");
             // Трей-меню
@@ -170,6 +184,42 @@ fn main() {
                     }
                 })
                 .build(app)?;
+
+            // Emit routing override to frontend after window appears (so UI select updates)
+            if let Some(mode) = routing_override.clone() {
+                let app_handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        if app_handle.get_webview_window("main").is_some() { break; }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    let payload = serde_json::json!({ "mode": mode });
+                    // Broadcast to all windows
+                    for (_, w) in app_handle.webview_windows() {
+                        let _ = w.emit("routing-mode", &payload);
+                    }
+                });
+            }
+
+            // If relaunched elevated with --openvpn-connect, connect after window becomes available
+            #[cfg(target_os = "windows")]
+            if elevated_relaunch {
+                if let Some(name) = auto_ovpn.clone() {
+                    let app_handle = app.handle().clone();
+                    std::thread::spawn(move || {
+                    // Wait up to ~5s for the main window to exist
+                    for _ in 0..50 {
+                            if app_handle.get_webview_window("main").is_some() { break; }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                        if let Err(e) = OpenVpnManager::connect(&app_handle, &name) {
+                        log::error!("[MAIN] Auto OpenVPN connect failed: {}", e);
+                    } else {
+                        log::info!("[MAIN] Auto OpenVPN connect started for '{}'", name);
+                    }
+                });
+                }
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -185,6 +235,8 @@ fn main() {
             exit_app,
             connect_vpn,
             disconnect_vpn,
+            openvpn_get_recent_logs,
+            openvpn_current_status,
             get_status,
             get_ip,
             start_connection_monitoring,

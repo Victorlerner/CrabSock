@@ -4,8 +4,23 @@
       <div class="w-12 h-12 border-4 border-gray-200 dark:border-neutral-700 rounded-full animate-spin border-t-blue-600"></div>
     </div>
     <div class="text-center">
-      <h3 class="text-lg font-medium text-gray-900 dark:text-gray-100">Connecting to Shadowsocks</h3>
+      <h3 class="text-lg font-medium text-gray-900 dark:text-gray-100">
+        Connecting to {{ displayName }}
+      </h3>
       <p class="text-sm text-gray-600 dark:text-gray-400 mt-1">Please wait...</p>
     </div>
   </div>
 </template>
+
+<script setup lang="ts">
+import { computed } from 'vue'
+import { useVpnStore } from '@src/stores/vpnStore'
+
+const store = useVpnStore()
+const displayName = computed(() => {
+  const cfg = store.parsedConfig
+  if (cfg?.name?.trim()) return cfg.name
+  if (cfg?.server && cfg?.port) return `${cfg.server}:${cfg.port}`
+  return store.ip || 'server'
+})
+</script>

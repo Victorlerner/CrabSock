@@ -142,11 +142,21 @@ export const useVpnStore = defineStore('vpn', {
         this.openvpnStatus = payload.status
         this.addLog('info', `[OpenVPN] ${payload.status}${payload?.detail ? `: ${payload.detail}` : ''}`, 'backend')
       })
+
+      // Routing mode override on relaunch (elevated) - keep UI select in sync
+      listen('routing-mode', (e: any) => {
+        const payload = e.payload as { mode?: string }
+        const m = (payload?.mode || '').toString().toLowerCase()
+        this.routingMode = m === 'tun' ? 'tun' : 'systemproxy'
+        this.addLog('info', `[Routing] Mode set to ${this.routingMode} by backend`, 'backend')
+      })
       listen('openvpn-log', (e: any) => {
         const line = String(e.payload ?? '')
         if (!line) return
         this.openvpnLogs.push(line)
         if (this.openvpnLogs.length > 500) this.openvpnLogs = this.openvpnLogs.slice(-500)
+        // Mirror into common Logs panel
+        // this.addLog('info', `[OpenVPN] ${line}`, 'backend')
       })
 
       // Listen for IP verification events
@@ -199,6 +209,42 @@ export const useVpnStore = defineStore('vpn', {
         await this.refreshIp()
       } catch (e) {
         // refreshIp уже залогирует ошибку
+      }
+
+      // Fetch OpenVPN current status and recent logs to populate UI after slow start or reload
+      try {
+        const st = await invoke('openvpn_current_status') as { status: Status, detail?: string }
+        if (st?.status) {
+          this.openvpnStatus = st.status
+          this.addLog('info', `[OpenVPN] ${st.status}${st?.detail ? `: ${st.detail}` : ''}`, 'backend')
+        }
+        const recent = await invoke('openvpn_get_recent_logs', { limit: 200 }) as string[]
+        if (recent && recent.length) {
+          this.openvpnLogs.push(...recent)
+          if (this.openvpnLogs.length > 500) this.openvpnLogs = this.openvpnLogs.slice(-500)
+          // Mirror into common Logs panel
+          for (const ln of recent) {
+            this.addLog('info', `[OpenVPN] ${ln}`, 'backend')
+          }
+        }
+        // Double-check process status in case we missed early events
+        const tuple = await invoke('openvpn_status') as [boolean, boolean] // [running, connected]
+        const running = !!tuple?.[0]
+        const connected = !!tuple?.[1]
+        if (connected) {
+          this.openvpnStatus = 'connected'
+        } else if (running && this.openvpnStatus !== 'connected') {
+          this.openvpnStatus = 'connecting'
+          // schedule a short retry to catch late 'connected'
+          setTimeout(async () => {
+            try {
+              const st2 = await invoke('openvpn_current_status') as { status: Status }
+              if (st2?.status) this.openvpnStatus = st2.status
+            } catch {}
+          }, 1200)
+        }
+      } catch (e) {
+        // optional; ignore if backend doesn't have any state yet
       }
     },
     async refreshOpenVpnConfigs() {

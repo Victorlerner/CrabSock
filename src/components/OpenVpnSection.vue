@@ -112,6 +112,7 @@ onMounted(() => {
       </div>
     </div>
 
+
     <div v-if="store.openvpnLogs.length && store.openvpnStatus !== 'disconnected'" class="mt-3">
       <div class="flex items-center justify-between mb-1">
         <div class="text-sm font-medium">OpenVPN Logs</div>

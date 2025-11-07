@@ -10,7 +10,9 @@
     <!-- Status Text -->
     <div class="text-center">
       <h3 class="text-xl font-semibold text-gray-900 dark:text-gray-100">Connected</h3>
-      <p class="text-sm text-gray-600 dark:text-gray-400 mt-1">Shadowsocks VPN is active</p>
+      <p class="text-sm text-gray-600 dark:text-gray-400 mt-1">
+        Connected to {{ connectedName }}
+      </p>
     </div>
 
     <!-- IP and Country Info -->
@@ -37,7 +39,7 @@
       class="flex items-center space-x-2 px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-gray-100 dark:bg-neutral-700 hover:bg-gray-200 dark:hover:bg-neutral-600 active:bg-gray-300 dark:active:bg-neutral-500 rounded-lg transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
       :disabled="store.isBusy"
     >
-      <div v-if="store.isBusy" class="w-4 h-4 border-2 border-gray-600 dark:border-gray-300 border-t-transparent rounded-full animate-spin"></div>
+      <span v-if="store.isBusy" class="w-4 h-4 border-2 border-gray-600 dark:border-gray-300 border-t-transparent rounded-full animate-spin"></span>
       <svg v-else class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6"></path>
       </svg>
@@ -48,6 +50,13 @@
 
 <script setup lang="ts">
 import { useVpnStore } from '@src/stores/vpnStore'
+import { computed } from 'vue'
 
 const store = useVpnStore()
+const connectedName = computed(() => {
+  const cfg = store.parsedConfig
+  if (cfg?.name?.trim()) return cfg.name
+  if (cfg?.server && cfg?.port) return `${cfg.server}:${cfg.port}`
+  return store.ip || 'server'
+})
 </script>

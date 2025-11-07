@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref, computed } from 'vue'
+import { onMounted, ref, computed, watch } from 'vue'
 import { useVpnStore } from '@src/stores/vpnStore'
 
 const store = useVpnStore()
@@ -31,6 +31,8 @@ const options = computed(() => {
 async function init() {
   osPlatform.value = detectPlatform()
   selected.value = store.routingMode
+  // Keep local select in sync with store updates (e.g., after relaunch/elevation)
+  watch(() => store.routingMode, (v) => { selected.value = v })
 }
 
 async function onChange() {
