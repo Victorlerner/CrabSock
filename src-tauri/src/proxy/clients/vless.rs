@@ -2,6 +2,9 @@ use crate::config::ProxyConfig;
 use crate::error::{VpnError, VpnResult};
 use crate::proxy::types::{ConnectionStatus, ProxyClient};
 use async_trait::async_trait;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::task::JoinHandle;
 #[cfg(target_os = "windows")]
 #[allow(unused_imports)]
 use std::os::windows::process::CommandExt;
@@ -10,10 +13,23 @@ pub struct VlessClient {
     config: ProxyConfig,
     status: ConnectionStatus,
     child: Option<tokio::process::Child>,
+    // New: supervised child and control
+    supervised_child: Arc<AsyncMutex<Option<tokio::process::Child>>>,
+    supervisor_stop: Arc<AtomicBool>,
+    supervisor_task: Option<JoinHandle<()>>,
 }
 
 impl VlessClient {
-    pub fn new(config: ProxyConfig) -> Self { Self { config, status: ConnectionStatus::Disconnected, child: None } }
+    pub fn new(config: ProxyConfig) -> Self {
+        Self {
+            config,
+            status: ConnectionStatus::Disconnected,
+            child: None,
+            supervised_child: Arc::new(AsyncMutex::new(None)),
+            supervisor_stop: Arc::new(AtomicBool::new(false)),
+            supervisor_task: None,
+        }
+    }
 
     fn build_singbox_config_json(&self) -> serde_json::Value {
         let server = self.config.server.clone();
@@ -24,6 +40,11 @@ impl VlessClient {
         let network = self.config.network.clone().unwrap_or_else(|| "tcp".to_string());
         let ws_path = self.config.ws_path.clone().unwrap_or_default();
         let ws_headers = self.config.ws_headers.clone().unwrap_or_default();
+        let flow = self.config.flow.clone().unwrap_or_default();
+        let fingerprint = self.config.fingerprint.clone().unwrap_or_default();
+        let security = self.config.security.clone().unwrap_or_else(|| "none".to_string());
+        let reality_public_key = self.config.reality_public_key.clone().unwrap_or_default();
+        let reality_short_id = self.config.reality_short_id.clone().unwrap_or_default();
 
         let mut outbound = serde_json::json!({
             "type": "vless",
@@ -32,10 +53,21 @@ impl VlessClient {
             "uuid": uuid,
         });
 
+        if !flow.is_empty() { outbound["flow"] = serde_json::Value::String(flow); }
+
         if tls_enabled {
             let mut tls = serde_json::json!({ "enabled": true });
             if !sni.is_empty() { tls["server_name"] = serde_json::Value::String(sni); }
             if let Some(skip) = self.config.skip_cert_verify { if skip { tls["insecure"] = serde_json::Value::Bool(true); } }
+            if !fingerprint.is_empty() {
+                tls["utls"] = serde_json::json!({ "enabled": true, "fingerprint": fingerprint });
+            }
+            if security == "reality" {
+                let mut reality = serde_json::json!({ "enabled": true });
+                if !reality_public_key.is_empty() { reality["public_key"] = serde_json::Value::String(reality_public_key); }
+                if !reality_short_id.is_empty() { reality["short_id"] = serde_json::Value::String(reality_short_id); }
+                tls["reality"] = reality;
+            }
             outbound["tls"] = tls;
         }
 
@@ -46,9 +78,13 @@ impl VlessClient {
             outbound["transport"] = transport;
         }
 
+        // Provide both HTTP (for WinINET/system proxy) and SOCKS inbounds
         serde_json::json!({
             "log": { "level": "info" },
-            "inbounds": [ { "type": "socks", "listen": "127.0.0.1", "listen_port": 1080, "sniff": true, "sniff_override_destination": true } ],
+            "inbounds": [
+                { "type": "http",  "listen": "127.0.0.1", "listen_port": 8080, "sniff": true },
+                { "type": "socks", "listen": "127.0.0.1", "listen_port": 1080, "sniff": true, "sniff_override_destination": true }
+            ],
             "outbounds": [ outbound ]
         })
     }
@@ -69,13 +105,16 @@ impl VlessClient {
 
 impl Drop for VlessClient {
     fn drop(&mut self) {
+        // signal supervisor to stop
+        self.supervisor_stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.supervisor_task.take() { let _ = handle.abort(); }
+
         if let Some(mut child) = self.child.take() {
             #[cfg(target_os = "windows")]
             {
                 if let Some(pid) = child.id() {
                     let _ = std::process::Command::new("taskkill")
-                        .creation_flags(0x08000000)
-                        .args(["/PID", &pid.to_string(), "/T", "/F"]) 
+                        .args(["/PID", &pid.to_string(), "/T", "/F"])
                         .stdin(std::process::Stdio::null())
                         .stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::null())
@@ -83,6 +122,10 @@ impl Drop for VlessClient {
                 }
             }
             let _ = child.start_kill();
+        }
+        // Also try to kill supervised child if present
+        if let Ok(mut guard) = self.supervised_child.try_lock() {
+            if let Some(mut c) = guard.take() { let _ = c.start_kill(); }
         }
     }
 }
@@ -120,7 +163,8 @@ impl ProxyClient for VlessClient {
         let sb_path = Self::resolve_singbox_path();
         log::info!("[VLESS] Starting sing-box: {:?} -c {}", sb_path, cfg_path.display());
 
-        let mut cmd = tokio::process::Command::new(sb_path);
+        // Initial spawn
+        let mut cmd = tokio::process::Command::new(&sb_path);
         cmd.arg("run").arg("-c").arg(&cfg_path);
         #[cfg(target_os = "windows")]
         { cmd.creation_flags(0x08000000); }
@@ -128,28 +172,107 @@ impl ProxyClient for VlessClient {
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
 
-        match cmd.spawn() {
-            Ok(child) => { self.child = Some(child); Ok(()) }
-            Err(e) => Err(VpnError::ConnectionFailed(format!("Failed to start sing-box: {}", e)))
+        let child = cmd.spawn().map_err(|e| VpnError::ConnectionFailed(format!("Failed to start sing-box: {}", e)))?;
+        // Track in both legacy and supervised holders
+        self.child = Some(child);
+        if self.child.is_some() {
+            let mut guard = self.supervised_child.lock().await;
+            // move handle into supervised slot
+            let taken = self.child.take();
+            *guard = taken;
         }
+
+        // Wait until local SOCKS is ready to accept connections
+        if let Err(e) = crate::net::socks::ensure_socks_ready("127.0.0.1", 1080).await {
+            log::warn!("[VLESS] Local SOCKS not ready in time: {}", e);
+        }
+
+        // Start supervisor to auto-restart on unexpected exit
+        let stop_flag = self.supervisor_stop.clone();
+        stop_flag.store(false, Ordering::SeqCst);
+        let supervised = self.supervised_child.clone();
+        let sb_path_cloned = sb_path.clone();
+        let cfg_path_cloned = cfg_path.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut backoff_ms: u64 = 1000;
+            loop {
+                if stop_flag.load(Ordering::SeqCst) { break; }
+
+                // Take current child (if any) and wait for it
+                let need_spawn = {
+                    let mut g = supervised.lock().await;
+                    if let Some(mut ch) = g.take() {
+                        // Wait for process to exit
+                        let _ = ch.wait().await;
+                        // proceed to respawn unless stopping
+                        !stop_flag.load(Ordering::SeqCst)
+                    } else {
+                        // nothing running -> need spawn
+                        true
+                    }
+                };
+
+                if !need_spawn { break; }
+                if stop_flag.load(Ordering::SeqCst) { break; }
+
+                // Exponential backoff between restarts
+                tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+
+                // Spawn new sing-box
+                let mut cmd = tokio::process::Command::new(&sb_path_cloned);
+                cmd.arg("run").arg("-c").arg(&cfg_path_cloned);
+                #[cfg(target_os = "windows")]
+                { cmd.creation_flags(0x08000000); }
+                cmd.kill_on_drop(true);
+                cmd.stdout(std::process::Stdio::null());
+                cmd.stderr(std::process::Stdio::null());
+                match cmd.spawn() {
+                    Ok(ch) => {
+                        let mut g = supervised.lock().await;
+                        *g = Some(ch);
+                        // reset backoff after successful spawn
+                        backoff_ms = 1000;
+                    }
+                    Err(e) => {
+                        log::error!("[VLESS] sing-box restart failed: {}", e);
+                    }
+                }
+            }
+        });
+        self.supervisor_task = Some(handle);
+
+        self.status = ConnectionStatus::Connected;
+        Ok(())
     }
 
     async fn disconnect(&mut self) -> VpnResult<()> {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill().await;
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(1500), child.wait()).await;
-            #[cfg(target_os = "windows")]
-            {
-                if let Some(pid) = child.id() {
-                    use tokio::process::Command as TokioCommand;
-                    let _ = TokioCommand::new("taskkill")
-                        .creation_flags(0x08000000)
-                        .args(["/PID", &pid.to_string(), "/T", "/F"]) 
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
-                        .await;
+        // Stop supervisor and kill process
+        self.supervisor_stop.store(true, Ordering::SeqCst);
+        if let Some(h) = self.supervisor_task.take() { let _ = h.abort(); }
+
+        // Kill supervised child
+        {
+            let mut guard = self.supervised_child.lock().await;
+            if let Some(mut child) = guard.take() {
+                let _ = child.kill().await;
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(1500), child.wait()).await;
+                #[cfg(target_os = "windows")]
+                {
+                    if let Some(pid) = child.id() {
+                        use tokio::process::Command as TokioCommand;
+                        let mut k = TokioCommand::new("taskkill");
+                        #[cfg(target_os = "windows")]
+                        { k.creation_flags(0x08000000); }
+                        let _ = k
+                            .args(["/PID", &pid.to_string(), "/T", "/F"]) 
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status()
+                            .await;
+                    }
                 }
             }
         }
@@ -206,9 +329,18 @@ mod tests {
         let c = VlessClient::new(cfg_ws_tls());
         let j: Value = c.build_singbox_config_json();
         assert_eq!(j["log"]["level"], "info");
-        assert_eq!(j["inbounds"][0]["type"], "socks");
-        assert_eq!(j["inbounds"][0]["listen"], "127.0.0.1");
-        assert_eq!(j["inbounds"][0]["listen_port"], 1080);
+        // Expect both HTTP:8080 and SOCKS:1080 inbounds (order not enforced)
+        let mut has_http = false;
+        let mut has_socks = false;
+        if let Some(arr) = j["inbounds"].as_array() {
+            for ib in arr {
+                let t = ib["type"].as_str().unwrap_or("");
+                let p = ib["listen_port"].as_i64().unwrap_or_default();
+                if t == "http" && p == 8080 { has_http = true; }
+                if t == "socks" && p == 1080 { has_socks = true; }
+            }
+        }
+        assert!(has_http && has_socks);
         assert_eq!(j["outbounds"][0]["type"], "vless");
         assert_eq!(j["outbounds"][0]["tls"]["enabled"], true);
         assert_eq!(j["outbounds"][0]["tls"]["server_name"], "sni.example");
