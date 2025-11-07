@@ -35,6 +35,10 @@ pub struct OpenVpnManager {
     management_password_path: Option<PathBuf>,
     connected: bool,
     temp_cfg_path: Option<PathBuf>,
+    #[cfg(target_os = "macos")]
+    pid_file_path: Option<PathBuf>,
+    #[cfg(target_os = "macos")]
+    log_file_path: Option<PathBuf>,
 }
 
 static GLOBAL_MGR: Lazy<Arc<Mutex<OpenVpnManager>>> = Lazy::new(|| Arc::new(Mutex::new(OpenVpnManager::default())));
@@ -116,12 +120,41 @@ impl OpenVpnManager {
             if let Ok(exe) = std::env::current_exe() {
                 if let Some(dir) = exe.parent() {
                     let exe_dir = dir.to_path_buf();
-                    let candidates = [
-                        exe_dir.join("resources").join("openvpn_macos").join("openvpn10"),
-                        exe_dir.join("resources").join("openvpn_macos").join("openvpn"),
-                        std::path::PathBuf::from("./src-tauri/resources/openvpn_macos/openvpn10"),
-                        std::path::PathBuf::from("./src-tauri/resources/openvpn_macos/openvpn"),
-                    ];
+                    // Prefer OpenVPN 2.x (supports management, data-ciphers), with arch-specific binary first
+                    // NOTE: On macOS, Tauri bundles resources into Contents/Resources, while the binary is in Contents/MacOS.
+                    // So check ../Resources/openvpn_macos/... first.
+                    let bundle_resources_dir = exe_dir.parent().map(|p| p.join("Resources"));
+                    #[cfg(target_arch = "aarch64")]
+                    let candidates = {
+                        let mut v = Vec::new();
+                        if let Some(res) = &bundle_resources_dir {
+                            v.push(res.join("openvpn_macos").join("openvpn_arm64"));
+                            v.push(res.join("openvpn_macos").join("openvpn"));
+                            v.push(res.join("openvpn_macos").join("openvpn10"));
+                        }
+                        // Legacy layout: alongside exec (dev or custom bundle)
+                        v.push(exe_dir.join("resources").join("openvpn_macos").join("openvpn_arm64"));
+                        v.push(exe_dir.join("resources").join("openvpn_macos").join("openvpn"));
+                        v.push(exe_dir.join("resources").join("openvpn_macos").join("openvpn10"));
+                        // Dev fallbacks from project root
+                        v.push(std::path::PathBuf::from("./src-tauri/resources/openvpn_macos/openvpn_arm64"));
+                        v.push(std::path::PathBuf::from("./src-tauri/resources/openvpn_macos/openvpn"));
+                        v.push(std::path::PathBuf::from("./src-tauri/resources/openvpn_macos/openvpn10"));
+                        v
+                    };
+                    #[cfg(not(target_arch = "aarch64"))]
+                    let candidates = {
+                        let mut v = Vec::new();
+                        if let Some(res) = &bundle_resources_dir {
+                            v.push(res.join("openvpn_macos").join("openvpn"));
+                            v.push(res.join("openvpn_macos").join("openvpn10"));
+                        }
+                        v.push(exe_dir.join("resources").join("openvpn_macos").join("openvpn"));
+                        v.push(exe_dir.join("resources").join("openvpn_macos").join("openvpn10"));
+                        v.push(std::path::PathBuf::from("./src-tauri/resources/openvpn_macos/openvpn"));
+                        v.push(std::path::PathBuf::from("./src-tauri/resources/openvpn_macos/openvpn10"));
+                        v
+                    };
                     for p in candidates {
                         if p.exists() {
                             let work = p.parent().unwrap_or(&exe_dir).to_path_buf();
@@ -189,9 +222,71 @@ impl OpenVpnManager {
     }
 
     pub fn connect(app: &AppHandle, name: &str) -> Result<(), String> {
+        // Ensure previous instance is stopped BEFORE starting a new one to avoid killing the fresh process
+        {
+            let global = OpenVpnManager::global();
+            let mut g = global.lock().unwrap();
+            g.disconnect_internal();
+        }
         let (exe, work_dir) = Self::find_openvpn_path(app)?;
         log::debug!("[OPENVPN] Binary: {}", exe.display());
         if !work_dir.as_os_str().is_empty() { log::debug!("[OPENVPN] Workdir: {}", work_dir.display()); }
+        // Also emit to frontend log for visibility
+        let msg = format!("[OPENVPN] Using binary: {}", exe.display());
+        let _ = app.emit("openvpn-log", msg.clone());
+        for (_, win) in app.webview_windows() { let _ = win.emit("openvpn-log", msg.clone()); }
+
+        // Try to detect version for diagnostics (capture both stdout/stderr)
+        let version_out = std::process::Command::new(&exe)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .ok()
+            .map(|o| {
+                let mut s = String::new();
+                if !o.stdout.is_empty() { s.push_str(&String::from_utf8_lossy(&o.stdout)); }
+                if !o.stderr.is_empty() { s.push_str(&String::from_utf8_lossy(&o.stderr)); }
+                s
+            })
+            .unwrap_or_default();
+        let version_line = version_out.lines().next().unwrap_or("unknown version").to_string();
+        let msg_v = format!("[OPENVPN] Detected version: {}", version_line);
+        let _ = app.emit("openvpn-log", msg_v.clone());
+        for (_, win) in app.webview_windows() { let _ = win.emit("openvpn-log", msg_v.clone()); }
+        // Detect management support. Prefer heuristic via --help content.
+        let help_out = std::process::Command::new(&exe)
+            .arg("--help")
+            .stdin(Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .ok()
+            .map(|o| {
+                let mut s = String::new();
+                if !o.stdout.is_empty() { s.push_str(&String::from_utf8_lossy(&o.stdout)); }
+                if !o.stderr.is_empty() { s.push_str(&String::from_utf8_lossy(&o.stderr)); }
+                s.to_ascii_lowercase()
+            })
+            .unwrap_or_default();
+        let exe_name = exe.file_name().and_then(|s| s.to_str()).unwrap_or_default().to_ascii_lowercase();
+        let looks_like_v3 = exe_name.contains("openvpn10") || version_line.to_ascii_lowercase().contains("openvpn 3");
+        let mentions_management = help_out.contains("management");
+        let mut supports_management = !looks_like_v3 && mentions_management;
+        // On macOS management caused parsing errors even when help said it's supported; disable for reliability.
+        #[cfg(target_os = "macos")]
+        {
+            supports_management = false;
+        }
+        let msg_supp = format!("[OPENVPN] Management support: {} (v3-like: {}, help has 'management': {})", supports_management, looks_like_v3, mentions_management);
+        let _ = app.emit("openvpn-log", msg_supp.clone());
+        for (_, win) in app.webview_windows() { let _ = win.emit("openvpn-log", msg_supp.clone()); }
+        if !supports_management {
+            let msg = "[OPENVPN] Skipping management injection for this binary";
+            let _ = app.emit("openvpn-log", msg);
+            for (_, win) in app.webview_windows() { let _ = win.emit("openvpn-log", msg); }
+        }
 
         let configs = Self::configs_dir(app)?;
         let mut cfg = configs.join(name);
@@ -219,6 +314,11 @@ impl OpenVpnManager {
             mgmt_path_str = mgmt_path_str.replace("\\", "\\\\");
         }
         let mgmt_line = format!("\nmanagement 127.0.0.1 {} {}\n", port, mgmt_path_str);
+        if supports_management {
+            let msg_mgmt = format!("[OPENVPN] Injecting management: 127.0.0.1 {} <pass_file>", port);
+            let _ = app.emit("openvpn-log", msg_mgmt.clone());
+            for (_, win) in app.webview_windows() { let _ = win.emit("openvpn-log", msg_mgmt.clone()); }
+        }
 
         // Build composed config; only handle bare auth-user-pass (no path)
         let mut composed_lines: Vec<String> = Vec::new();
@@ -249,14 +349,24 @@ impl OpenVpnManager {
                 { auth_str = auth_str.replace("\\", "\\\\"); }
                 composed_lines.push(format!("auth-user-pass {}", auth_str));
             } else {
-                log::warn!("[OPENVPN] 'auth-user-pass' present but no .auth file next to config: {}", auth_path.display());
+                let msg = format!("[OPENVPN] 'auth-user-pass' present but no .auth file next to config: {}", auth_path.display());
+                log::warn!("{}", msg);
+                // Also emit to UI logs for clarity
+                let _ = app.emit("openvpn-log", msg.clone());
+                for (_, win) in app.webview_windows() { let _ = win.emit("openvpn-log", msg.clone()); }
+                return Err("OpenVPN config requires credentials (auth-user-pass) but no .auth file was found next to the .ovpn. Create a .auth file with two lines: username and password.".to_string());
             }
         }
         composed_lines.push(String::new());
-        composed_lines.push(mgmt_line);
+        if supports_management {
+            composed_lines.push(mgmt_line);
+        }
         let composed = composed_lines.join("\n");
         fs::write(&tmp_cfg, composed).map_err(|e| format!("Failed to write temp config: {}", e))?;
         log::debug!("[OPENVPN] Temp config: {} (management port {})", tmp_cfg.display(), port);
+        let msg_cfg = format!("[OPENVPN] Temp config written: {} (mgmt port {})", tmp_cfg.display(), port);
+        let _ = app.emit("openvpn-log", msg_cfg.clone());
+        for (_, win) in app.webview_windows() { let _ = win.emit("openvpn-log", msg_cfg.clone()); }
 
         // Build args similar to Pritunl: --config <cfg> --verb 2
         let mut args = vec!["--config".to_string(), tmp_cfg.to_string_lossy().to_string(), "--verb".to_string(), "2".to_string()];
@@ -266,6 +376,9 @@ impl OpenVpnManager {
             args.push("1".to_string());
         }
         log::debug!("[OPENVPN] Args: {:?}", args);
+        let msg_args = format!("[OPENVPN] Launch args: {:?}", args);
+        let _ = app.emit("openvpn-log", msg_args.clone());
+        for (_, win) in app.webview_windows() { let _ = win.emit("openvpn-log", msg_args.clone()); }
         #[cfg(target_os = "linux")]
         {
             if !has_apparmor() {
@@ -307,39 +420,221 @@ impl OpenVpnManager {
         };
         #[cfg(not(target_os = "windows"))]
         let mut child: Option<Child> = {
+            // Best-effort: ensure the bundled binary is executable and not quarantined (macOS)
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(&exe) {
+                    let mut perm = meta.permissions();
+                    let mode = perm.mode();
+                    // ensure owner/group/world execute bits
+                    let target = mode | 0o111;
+                    if target != mode {
+                        perm.set_mode(target);
+                        let _ = std::fs::set_permissions(&exe, perm);
+                        let msg = format!("[OPENVPN] Set executable bit on {}", exe.display());
+                        let _ = app.emit("openvpn-log", msg.clone());
+                        for (_, win) in app.webview_windows() { let _ = win.emit("openvpn-log", msg.clone()); }
+                    }
+                }
+            }
+            #[cfg(target_os = "macos")]
+            {
+                // Remove quarantine attribute if present; ignore errors
+                let _ = std::process::Command::new("xattr")
+                    .args(["-d", "com.apple.quarantine", &exe.to_string_lossy()])
+                    .stdin(Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                let msg = format!("[OPENVPN] Attempted to remove quarantine attribute from {}", exe.display());
+                let _ = app.emit("openvpn-log", msg.clone());
+                for (_, win) in app.webview_windows() { let _ = win.emit("openvpn-log", msg.clone()); }
+            }
+
+            // On macOS, run elevated; otherwise regular spawn
+            #[cfg(target_os = "macos")]
+            {
+                let is_root = std::process::Command::new("id").arg("-u").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0").unwrap_or(false);
+                let tmp_dir = Self::temp_dir(app)?;
+                let pid_file = tmp_dir.join(format!("{}-openvpn.pid", name));
+                let log_file = tmp_dir.join(format!("{}-openvpn.log", name));
+                let elevated_args = args_with_log.clone();
+                let script_path = tmp_dir.join(format!("{}-openvpn-elev.sh", name));
+                // Build daemon args so OpenVPN forks itself and writes pid/log
+                let mut daemon_args = elevated_args.clone();
+                daemon_args.push("--writepid".to_string());
+                daemon_args.push(pid_file.to_string_lossy().to_string());
+                daemon_args.push("--log".to_string());
+                daemon_args.push(log_file.to_string_lossy().to_string());
+                daemon_args.push("--daemon".to_string());
+                if !is_root {
+                let exe_q = exe.to_string_lossy().replace('"', "\\\"");
+                let args_joined = daemon_args
+                    .iter()
+                    .map(|a| format!("\"{}\"", a.replace('"', "\\\"")))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let mut script = String::new();
+                script.push_str("#!/bin/sh\nset -e\n");
+                script.push_str("export PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin\n");
+                if !work_dir.as_os_str().is_empty() {
+                    script.push_str(&format!("cd \"{}\"\n", work_dir.to_string_lossy().replace('"', "\\\"")));
+                }
+                // Run OpenVPN with --daemon; it will fork, write pid/log, and return
+                script.push_str(&format!("exec \"{}\" {}\n", exe_q, args_joined));
+                std::fs::write(&script_path, script).map_err(|e| format!("Failed to write elevate script: {}", e))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(meta) = std::fs::metadata(&script_path) {
+                        let mut p = meta.permissions();
+                        p.set_mode(0o755);
+                        let _ = std::fs::set_permissions(&script_path, p);
+                    }
+                }
+
+                // Build AppleScript to run the shell script with admin privileges
+                let osa_script = format!(
+                    "do shell script \"/bin/sh '{}'\" with administrator privileges",
+                    script_path.to_string_lossy().replace('"', "\\\"")
+                );
+                let out = std::process::Command::new("osascript")
+                    .args(["-e", &osa_script])
+                    .stdin(Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .output();
+                match out {
+                    Ok(o) if o.status.success() => {
+                        let msg = format!("[OPENVPN] Started elevated via osascript; tailing {}", log_file.display());
+                        let _ = app.emit("openvpn-log", msg.clone());
+                        for (_, win) in app.webview_windows() { let _ = win.emit("openvpn-log", msg.clone()); }
+                        let app_handle3 = app.clone();
+                        let log_for_tail = log_file.clone();
+                        std::thread::spawn(move || { tail_log_file(&log_for_tail, &app_handle3); });
+                        {
+                            if let Ok(mut guard) = OpenVpnManager::global().lock() {
+                                guard.pid_file_path = Some(pid_file.clone());
+                                guard.log_file_path = Some(log_file.clone());
+                            }
+                        }
+                        None
+                    }
+                    Ok(o) => {
+                        let so = String::from_utf8_lossy(&o.stdout);
+                        let se = String::from_utf8_lossy(&o.stderr);
+                        let msg = format!("[OPENVPN][ELEVATE][osascript] status={:?} stdout='{}' stderr='{}'", o.status.code(), so.trim(), se.trim());
+                        let _ = app.emit("openvpn-log", msg.clone());
+                        for (_, win) in app.webview_windows() { let _ = win.emit("openvpn-log", msg.clone()); }
+                        return Err(format!("Failed to elevate OpenVPN (status {:?})", o.status.code()));
+                    }
+                    Err(e) => { return Err(format!("Failed to invoke osascript: {}", e)); }
+                }
+            } else {
+                let mut cmd = Command::new(&exe);
+                // Run directly as root using daemon args
+                let mut daemon_args = args_with_log.clone();
+                daemon_args.push("--writepid".to_string());
+                daemon_args.push(pid_file.to_string_lossy().to_string());
+                daemon_args.push("--log".to_string());
+                daemon_args.push(log_file.to_string_lossy().to_string());
+                daemon_args.push("--daemon".to_string());
+                cmd.args(&daemon_args)
+                    .stdin(Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                if !work_dir.as_os_str().is_empty() { cmd.current_dir(&work_dir); }
+                let st = cmd.status().map_err(|e| format!("Failed to start OpenVPN: {}", e))?;
+                if !st.success() { return Err(format!("OpenVPN exited immediately with status {:?}", st.code())); }
+                let app_handle3 = app.clone();
+                let log_for_tail = log_file.clone();
+                std::thread::spawn(move || { tail_log_file(&log_for_tail, &app_handle3); });
+                {
+                    if let Ok(mut guard) = OpenVpnManager::global().lock() {
+                        guard.pid_file_path = Some(pid_file.clone());
+                        guard.log_file_path = Some(log_file.clone());
+                    }
+                }
+                None
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
             let mut cmd = Command::new(&exe);
             cmd.args(&args_with_log)
                 .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
             if !work_dir.as_os_str().is_empty() { cmd.current_dir(&work_dir); }
-            let ch = cmd.spawn().map_err(|e| format!("Failed to start OpenVPN: {}", e))?;
+            let ch = match cmd.spawn() {
+                Ok(ch) => ch,
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::PermissionDenied {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            if let Ok(meta) = std::fs::metadata(&exe) {
+                                let mut perm = meta.permissions();
+                                perm.set_mode(0o755);
+                                let _ = std::fs::set_permissions(&exe, perm);
+                                let msg = format!("[OPENVPN] Permission denied; applied chmod 755 to {}", exe.display());
+                                let _ = app.emit("openvpn-log", msg.clone());
+                                for (_, win) in app.webview_windows() { let _ = win.emit("openvpn-log", msg.clone()); }
+                            }
+                        }
+                        let retry = Command::new(&exe)
+                            .args(&args_with_log)
+                            .stdin(Stdio::null())
+                            .stdout(std::process::Stdio::piped())
+                            .stderr(std::process::Stdio::piped())
+                            .current_dir(&work_dir)
+                            .spawn();
+                        match retry {
+                            Ok(ch2) => ch2,
+                            Err(e2) => {
+                                let msg = format!("[OPENVPN] Retry spawn failed: {}", e2);
+                                let _ = app.emit("openvpn-log", msg.clone());
+                                for (_, win) in app.webview_windows() { let _ = win.emit("openvpn-log", msg.clone()); }
+                                return Err(format!("Failed to start OpenVPN: {}", e2));
+                            }
+                        }
+                    } else {
+                        let msg = format!("[OPENVPN] Spawn failed: {}", e);
+                        let _ = app.emit("openvpn-log", msg.clone());
+                        for (_, win) in app.webview_windows() { let _ = win.emit("openvpn-log", msg.clone()); }
+                        return Err(format!("Failed to start OpenVPN: {}", e));
+                    }
+                }
+            };
             log::debug!("[OPENVPN] PID: {}", ch.id());
             Some(ch)
+        }
+
         };
 
-        // Setup log readers
-        let stdout = child.as_mut().and_then(|c| c.stdout.take());
-        let stderr = child.as_mut().and_then(|c| c.stderr.take());
-        let app_handle = app.clone();
-        thread::spawn(move || {
-            if let Some(out) = stdout { read_and_emit_logs(out, &app_handle); }
-        });
-        let app_handle2 = app.clone();
-        thread::spawn(move || {
-            if let Some(err) = stderr { read_and_emit_logs(err, &app_handle2); }
-        });
-        // Tail log file path was used when elevating OpenVPN itself; no longer needed.
+        // Setup log readers only if we have a direct child process (non-macOS flow)
+        if let Some(c) = child.as_mut() {
+            let stdout = c.stdout.take();
+            let stderr = c.stderr.take();
+            let app_handle = app.clone();
+            thread::spawn(move || {
+                if let Some(out) = stdout { read_and_emit_logs(out, &app_handle); }
+            });
+            let app_handle2 = app.clone();
+            thread::spawn(move || {
+                if let Some(err) = stderr { read_and_emit_logs(err, &app_handle2); }
+            });
+        }
 
         // Persist state
         {
             let global = OpenVpnManager::global();
             let mut g = global.lock().unwrap();
-            g.disconnect_internal();
             g.process = child;
             g.active_config_name = Some(name.to_string());
-            g.management_port = Some(port);
-            g.management_password_path = Some(management_password_path.clone());
+            g.management_port = if supports_management { Some(port) } else { None };
+            g.management_password_path = if supports_management { Some(management_password_path.clone()) } else { None };
             g.connected = false;
             g.temp_cfg_path = Some(tmp_cfg.clone());
         }
@@ -393,6 +688,9 @@ impl OpenVpnManager {
             for (_, win) in app.webview_windows() { let _ = win.emit("openvpn-status", evt.clone()); }
             let _ = app.emit("openvpn-status", evt);
             log::debug!("[OPENVPN] Status -> disconnected");
+            // Also emit generic status for UI
+            for (_, win) in app.webview_windows() { let _ = win.emit("status", serde_json::json!({ "status": "disconnected" })); }
+            let _ = app.emit("status", serde_json::json!({ "status": "disconnected" }));
         }
         Ok(())
     }
@@ -405,6 +703,44 @@ impl OpenVpnManager {
                 thread::sleep(Duration::from_millis(300));
             }
             let _ = child.kill();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // If elevated (no child), try kill by pid file
+            if self.process.is_none() {
+                if let Some(pid_path) = self.pid_file_path.as_ref() {
+                    if let Ok(pid_str) = std::fs::read_to_string(pid_path) {
+                        if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                            // Try unprivileged SIGTERM first (may fail if process is root)
+                            let term_status = std::process::Command::new("kill").arg("-TERM").arg(pid.to_string())
+                                .stdin(Stdio::null())
+                                .stdout(std::process::Stdio::null())
+                                .stderr(std::process::Stdio::null())
+                                .status()
+                                .ok();
+                            let mut need_elevated_kill = true;
+                            if let Some(st) = term_status {
+                                // Success only if exit status is 0
+                                need_elevated_kill = !st.success();
+                            }
+                            if need_elevated_kill {
+                                // Attempt elevated kill via AppleScript to handle root-owned OpenVPN
+                                let osa = format!(
+                                    "do shell script \"kill -TERM {pid}; sleep 0.2; kill -KILL {pid} 2>/dev/null || true\" with administrator privileges",
+                                );
+                                let _ = std::process::Command::new("osascript")
+                                    .args(["-e", &osa])
+                                    .stdin(Stdio::null())
+                                    .stdout(std::process::Stdio::null())
+                                    .stderr(std::process::Stdio::null())
+                                    .status();
+                            }
+                            // Best-effort: remove stale pid file
+                            let _ = std::fs::remove_file(pid_path);
+                        }
+                    }
+                }
+            }
         }
         #[cfg(target_os = "windows")]
         {
@@ -436,6 +772,11 @@ impl OpenVpnManager {
         self.management_password_path = None;
         self.connected = false;
         self.temp_cfg_path = None;
+        #[cfg(target_os = "macos")]
+        {
+            self.pid_file_path = None;
+            self.log_file_path = None;
+        }
     }
 
     pub fn status() -> (bool, bool) {
@@ -467,6 +808,9 @@ fn read_and_emit_logs<R: std::io::Read + Send + 'static>(reader: R, app: &AppHan
             let _ = app.emit("openvpn-status", evt);
             log::debug!("[OPENVPN] Status -> connected (init complete)");
             if let Ok(mut g) = OpenVpnManager::global().lock() { g.connected = true; }
+            // Also emit generic status event for UI consumers
+            for (_, win) in app.webview_windows() { let _ = win.emit("status", serde_json::json!({ "status": "connected" })); }
+            let _ = app.emit("status", serde_json::json!({ "status": "connected" }));
         }
     }
 }
@@ -499,6 +843,9 @@ fn tail_log_file(path: &Path, app: &AppHandle) {
                 for (_, win) in app.webview_windows() { let _ = win.emit("openvpn-status", evt.clone()); }
                 let _ = app.emit("openvpn-status", evt);
                 if let Ok(mut g) = OpenVpnManager::global().lock() { g.connected = true; }
+                // Also emit generic status event for UI consumers
+                for (_, win) in app.webview_windows() { let _ = win.emit("status", serde_json::json!({ "status": "connected" })); }
+                let _ = app.emit("status", serde_json::json!({ "status": "connected" }));
             }
         }
     }
