@@ -128,9 +128,14 @@ impl OpenVpnManager {
                     let candidates = {
                         let mut v = Vec::new();
                         if let Some(res) = &bundle_resources_dir {
+                            // Standard Tauri layout when individual files/dirs are listed under bundle.resources
                             v.push(res.join("openvpn_macos").join("openvpn_arm64"));
                             v.push(res.join("openvpn_macos").join("openvpn"));
                             v.push(res.join("openvpn_macos").join("openvpn10"));
+                            // When the entire "resources" directory is bundled, paths become Resources/resources/...
+                            v.push(res.join("resources").join("openvpn_macos").join("openvpn_arm64"));
+                            v.push(res.join("resources").join("openvpn_macos").join("openvpn"));
+                            v.push(res.join("resources").join("openvpn_macos").join("openvpn10"));
                         }
                         // Legacy layout: alongside exec (dev or custom bundle)
                         v.push(exe_dir.join("resources").join("openvpn_macos").join("openvpn_arm64"));
@@ -146,8 +151,12 @@ impl OpenVpnManager {
                     let candidates = {
                         let mut v = Vec::new();
                         if let Some(res) = &bundle_resources_dir {
+                            // Standard Tauri layout
                             v.push(res.join("openvpn_macos").join("openvpn"));
                             v.push(res.join("openvpn_macos").join("openvpn10"));
+                            // Bundled "resources" directory layout
+                            v.push(res.join("resources").join("openvpn_macos").join("openvpn"));
+                            v.push(res.join("resources").join("openvpn_macos").join("openvpn10"));
                         }
                         v.push(exe_dir.join("resources").join("openvpn_macos").join("openvpn"));
                         v.push(exe_dir.join("resources").join("openvpn_macos").join("openvpn10"));
