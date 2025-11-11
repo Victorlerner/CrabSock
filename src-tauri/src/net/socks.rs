@@ -30,9 +30,13 @@ pub fn get_socks_endpoint() -> (String, u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use once_cell::sync::Lazy;
+    use std::sync::Mutex;
+    static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
     #[test]
     fn parse_plain_host_only_defaults_port() {
+        let _g = ENV_LOCK.lock().unwrap();
         std::env::set_var("SOCKS_PROXY", "socks5://localhost");
         let (h, p) = get_socks_endpoint();
         assert_eq!(h, "localhost");
@@ -42,6 +46,7 @@ mod tests {
 
     #[test]
     fn parse_host_and_port() {
+        let _g = ENV_LOCK.lock().unwrap();
         std::env::set_var("SOCKS_PROXY", "socks5h://127.0.0.1:1081");
         let (h, p) = get_socks_endpoint();
         assert_eq!(h, "127.0.0.1");
@@ -51,6 +56,7 @@ mod tests {
 
     #[test]
     fn parse_with_auth_and_path() {
+        let _g = ENV_LOCK.lock().unwrap();
         std::env::set_var("SOCKS_PROXY", "socks5://user:pass@10.0.0.2:9999/foo");
         let (h, p) = get_socks_endpoint();
         assert_eq!(h, "10.0.0.2");

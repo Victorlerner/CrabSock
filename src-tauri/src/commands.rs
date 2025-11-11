@@ -16,9 +16,65 @@ use std::process::Stdio;
 use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
-use crate::openvpn::{OpenVpnManager, OpenVpnConfigInfo};
-#[cfg(target_os = "windows")]
 use crate::openvpn;
+use crate::openvpn::{OpenVpnManager, OpenVpnConfigInfo};
+
+#[cfg(target_os = "macos")]
+fn is_root_macos() -> bool {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "0")
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn relaunch_elevated_with_args_macos(args: &[&str]) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let app_bundle = exe
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .ok_or_else(|| "Failed to locate .app bundle".to_string())?;
+    let app_path = app_bundle.to_string_lossy().to_string();
+    // Build shell-safe single-quoted args: 'foo' becomes 'foo' with internal ' escaped as '\''.
+    fn sh_single_quote(s: &str) -> String {
+        format!("'{}'", s.replace('\'', "'\"'\"'"))
+    }
+    let args_joined = args.iter().map(|a| sh_single_quote(a)).collect::<Vec<_>>().join(" ");
+    // Write a temporary script that relaunches the app with args
+    let mut script_path = std::env::temp_dir();
+    script_path.push("crabsock-relaunch-elev.sh");
+    let script = format!(
+        "#!/bin/sh\nset -e\nexport PATH=/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin\nopen -n {} --args {}\n",
+        sh_single_quote(&app_path),
+        args_joined
+    );
+    std::fs::write(&script_path, script).map_err(|e| e.to_string())?;
+    if let Ok(meta) = std::fs::metadata(&script_path) {
+        let mut p = meta.permissions();
+        p.set_mode(0o755);
+        let _ = std::fs::set_permissions(&script_path, p);
+    }
+    // Run the script via AppleScript with admin privileges
+    let osa = format!(
+        "do shell script \"/bin/sh '{}'\" with administrator privileges",
+        script_path.to_string_lossy().replace('"', "\\\"")
+    );
+    let out = std::process::Command::new("osascript")
+        .args(["-e", &osa])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() { Ok(()) } else {
+        let se = String::from_utf8_lossy(&out.stderr);
+        Err(format!("Failed to trigger elevation (osascript): {}", se.trim()))
+    }
+}
 
 #[cfg(target_os = "windows")]
 fn relaunch_elevated_with_args(args: &[&str]) -> Result<(), String> {

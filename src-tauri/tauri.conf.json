@@ -28,7 +28,10 @@
     "resources": [
       "resources/sing-box/sing-box.exe",
       "resources/openvpn_win/openvpn_amd64",
-      "resources/openvpn_win/openvpn_arm64"
+      "resources/openvpn_win/openvpn_arm64",
+      "resources/openvpn_macos/openvpn",
+      "resources/openvpn_macos/openvpn_arm64",
+      "resources/openvpn_macos/openvpn10"
     ],
     "icon": [
       "icons/32x32.png",

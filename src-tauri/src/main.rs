@@ -202,7 +202,7 @@ fn main() {
             }
 
             // If relaunched elevated with --openvpn-connect, connect after window becomes available
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
             if elevated_relaunch {
                 if let Some(name) = auto_ovpn.clone() {
                     let app_handle = app.handle().clone();
