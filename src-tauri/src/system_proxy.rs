@@ -390,6 +390,7 @@ function FindProxyForURL(url, host) {{
         // On macOS we configure SOCKS proxy using `networksetup` for all network services
         // We intentionally only set SOCKS to keep HTTP/HTTPS untouched
         let services = list_macos_network_services();
+        log::info!("[SYSTEM_PROXY][macOS] Network services: {:?}", services);
 
         // Determine host:port from provided settings (prefer SOCKS5)
         let maybe_socks = settings
@@ -401,6 +402,7 @@ function FindProxyForURL(url, host) {{
         if let Some(socks_url) = maybe_socks {
             // Normalize to host, port
             let (host, port) = parse_socks_host_port(&socks_url).unwrap_or(("127.0.0.1".to_string(), 1080u16));
+            log::info!("[SYSTEM_PROXY][macOS] Applying SOCKS {}:{} + HTTP/HTTPS 127.0.0.1:8080", host, port);
 
             for service in services {
                 // networksetup -setsocksfirewallproxy "Wi-Fi" host port
@@ -491,6 +493,9 @@ function FindProxyForURL(url, host) {{
             } else {
                 log::warn!("[SYSTEM_PROXY][macOS] Failed to write PAC file; relying on SOCKS + domain bypass only");
             }
+            // Verify via scutil
+            let verified = verify_macos_proxies();
+            log::info!("[SYSTEM_PROXY][macOS] Verification via scutil --proxy: {}", verified);
         } else {
             // Disable SOCKS proxy on all services
             for service in services {
@@ -537,7 +542,7 @@ function FindProxyForURL(url, host) {{
         log::info!("[SYSTEM_PROXY] Setting TUN mode: {}", enable);
         
         if enable {
-            // Включаем TUN режим - весь трафик идет через VPN
+            // Включаем TUN режим - на macOS/Linux не используем системный прокси вовсе
             self.enable_tun_mode().await?;
         } else {
             // Отключаем TUN режим
@@ -550,18 +555,14 @@ function FindProxyForURL(url, host) {{
     }
 
     async fn enable_tun_mode(&mut self) -> Result<()> {
-        log::info!("[SYSTEM_PROXY] Enabling TUN mode - using system proxy with TUN interface");
-        
+        log::info!("[SYSTEM_PROXY] Enabling TUN mode - clearing system proxies (macOS/Linux)");
         // Сохраняем текущие настройки прокси
         if self.original_settings.is_none() {
             self.original_settings = Some(self.get_current_proxy_settings().await?);
         }
-
-        // Устанавливаем системный прокси на наш SOCKS5 прокси
-        // TUN интерфейс будет использоваться для мониторинга, но трафик идет через системный прокси
-        let proxy_settings = ProxySettings::with_socks5("127.0.0.1", 1080);
-        self.set_proxy_settings(&proxy_settings).await?;
-
+        // В TUN режиме не выставляем прокси: очищаем их, чтобы трафик шел через TUN
+        let empty = ProxySettings::new();
+        self.set_proxy_settings(&empty).await?;
         Ok(())
     }
 

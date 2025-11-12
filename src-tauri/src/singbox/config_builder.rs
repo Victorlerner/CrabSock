@@ -8,6 +8,9 @@ use crate::outbound::factory::make_from_env;
 pub fn build_singbox_config(cfg: &TunConfig, socks_host: String, socks_port: u16) -> Result<PathBuf> {
     use std::net::{IpAddr, ToSocketAddrs};
 
+    let sb_log_level = std::env::var("SB_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+    log::info!("[SING-BOX][CONFIG] Building sing-box config (log.level={sb_log_level}, socks={socks_host}:{socks_port})");
+
     let mut direct_cidrs: Vec<String> = vec![
         "127.0.0.0/8".to_string(),
         "10.0.0.0/8".to_string(),
@@ -49,9 +52,10 @@ pub fn build_singbox_config(cfg: &TunConfig, socks_host: String, socks_port: u16
     dns_rules.push(json!({ "query_type": [32, 33], "server": "dns-block" }));
     dns_rules.push(json!({ "domain_suffix": [".lan"], "server": "dns-block" }));
 
-    let mut inbounds: Vec<serde_json::Value> = vec![json!({
+    // Build TUN inbound; on macOS we will prefer system stack and relaxed routing to improve compatibility
+    let mut tun_inbound = json!({
         "type": "tun",
-        "interface_name": cfg.name,
+        "tag": "tun-in",
         "address": [ inet4 ],
         "mtu": 1400,
         "auto_route": true,
@@ -60,9 +64,32 @@ pub fn build_singbox_config(cfg: &TunConfig, socks_host: String, socks_port: u16
         "sniff": true,
         "sniff_override_destination": false,
         "stack": "gvisor"
-    })];
+    });
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Safe to set interface name on non-macOS platforms
+        if let Some(obj) = tun_inbound.as_object_mut() {
+            obj.insert("interface_name".to_string(), serde_json::Value::String(cfg.name.clone()));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // On macOS prefer system stack and relaxed strict_route (some setups fail to apply default route with gVisor)
+        if let Some(obj) = tun_inbound.as_object_mut() {
+            obj.insert("stack".to_string(), serde_json::Value::String("system".to_string()));
+            obj.insert("strict_route".to_string(), serde_json::Value::Bool(false));
+            // Allow overriding interface name via env (off by default)
+            if let Ok(ifn) = std::env::var("SB_TUN_IFACE_NAME") {
+                if !ifn.is_empty() {
+                    obj.insert("interface_name".to_string(), serde_json::Value::String(ifn));
+                }
+            }
+        }
+    }
+    let mut inbounds: Vec<serde_json::Value> = vec![tun_inbound];
     if std::env::var("SINGBOX_ENABLE_MIXED").ok().as_deref() == Some("1") {
         let mixed_port: u16 = std::env::var("SINGBOX_MIXED_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(1081);
+        log::info!("[SING-BOX][CONFIG] Enabling mixed inbound on 127.0.0.1:{mixed_port}");
         inbounds.push(json!({
             "type": "mixed",
             "tag": "mixed-in",
@@ -74,7 +101,7 @@ pub fn build_singbox_config(cfg: &TunConfig, socks_host: String, socks_port: u16
     }
 
     let doc = json!({
-        "log": { "level": "warn" },
+        "log": { "level": sb_log_level, "timestamp": true },
         "inbounds": inbounds,
         "dns": {
             "independent_cache": true,
@@ -103,6 +130,7 @@ pub fn build_singbox_config(cfg: &TunConfig, socks_host: String, socks_port: u16
     let temp = std::env::temp_dir().join(format!("crabsock-singbox-{}.json", std::process::id()));
     std::fs::write(&temp, doc.to_string())
         .map_err(|e| anyhow::anyhow!(format!("write sing-box config failed: {}", e)))?;
+    log::info!("[SING-BOX][CONFIG] Wrote config to {}", temp.display());
     Ok(temp)
 }
 

@@ -1,0 +1,37 @@
+CrabSock  
+Cross-platform unified client for OpenVPN and Sing-box  
+Copyright (c) 2025 Viktor Lerner  
+
+Licensed under the Apache License, Version 2.0 (the "License");  
+you may not use this file except in compliance with the License.  
+You may obtain a copy of the License at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software  
+distributed under the License is distributed on an "AS IS" BASIS,  
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  
+See the License for the specific language governing permissions and  
+limitations under the License.
+
+---
+
+### Third-Party Notices
+
+This project includes or bundles third-party software components.  
+Their respective licenses and notices are retained in their original  
+locations or upstream archives.
+
+- **OpenVPN distributions (macOS and Windows)**  
+  License files:  
+  - `src-tauri/resources/openvpn_macos/LICENSE`  
+  - `src-tauri/resources/openvpn_win/` (Windows installers)
+
+- **OpenSSL, LZ4, LZO, Autoconf, Automake, Libtool, pkcs11-helper, iperf**  
+  Bundled artifacts reside under `src-tauri/resources/openvpn_macos/`.  
+  Refer to the upstream archives for their licenses and notices.
+
+- **Sing-box runtime (Darwin / Windows)**  
+  Bundled binaries reside under `src-tauri/resources/sing-box/`.  
+  Refer to the upstream project for licensing information.
+
