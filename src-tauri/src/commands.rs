@@ -308,6 +308,7 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                         std::env::remove_var("SB_SS_METHOD");
                         std::env::remove_var("SB_SS_PASSWORD");
                         std::env::set_var("SB_OUTBOUND_TYPE", "vless");
+                        std::env::remove_var("ACL_HTTP_PORT"); // use default 8080 for sing-box http inbound
                         std::env::set_var("SB_VLESS_SERVER", &config.server);
                         std::env::set_var("SB_VLESS_PORT", config.port.to_string());
                         if let Some(uuid) = &config.uuid { std::env::set_var("SB_VLESS_UUID", uuid); }
@@ -333,6 +334,8 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                         std::env::remove_var("SB_VLESS_SPX");
                         // For TUN use sing-box outbound=shadowsocks directly to upstream
                         std::env::set_var("SB_OUTBOUND_TYPE", "shadowsocks");
+                             // Use a non-conflicting HTTP port for ACL proxy when SS is active
+                            std::env::set_var("ACL_HTTP_PORT", "9080");
                         std::env::set_var("SB_SS_SERVER", &config.server);
                         std::env::set_var("SB_SS_PORT", config.port.to_string());
                         if let Some(method) = &config.method { std::env::set_var("SB_SS_METHOD", method); }
@@ -495,6 +498,10 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                             let mut system_manager = SYSTEM_PROXY_MANAGER.lock().await;
                             if let Err(e) = system_manager.set_system_proxy(&proxy_settings).await {
                                 log::warn!("[CONNECT] Failed to set system proxy automatically: {}", e);
+                            }
+                            // Note: macOS HTTP/HTTPS will follow ACL_HTTP_PORT (env) inside SystemProxyManager
+                            if let Ok(p) = std::env::var("ACL_HTTP_PORT") {
+                                log::info!("[ROUTING] SystemProxy HTTP port (ACL_HTTP_PORT) = {}", p);
                             }
                         }
                     }

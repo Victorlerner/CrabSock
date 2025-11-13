@@ -438,12 +438,13 @@ function FindProxyForURL(url, host) {{
                         let _ = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
                     }
                 }
-                // Point HTTP/HTTPS at local ACL HTTP proxy 127.0.0.1:8080 so browsers always hit ACL
+                // Point HTTP/HTTPS at local ACL HTTP proxy 127.0.0.1:<ACL_HTTP_PORT> so browsers always hit ACL
+                let http_port: u16 = std::env::var("ACL_HTTP_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8080);
                 let _ = std::process::Command::new("networksetup")
                     .arg("-setwebproxy")
                     .arg(&service)
                     .arg("127.0.0.1")
-                    .arg("8080")
+                    .arg(http_port.to_string())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .status();
@@ -458,7 +459,7 @@ function FindProxyForURL(url, host) {{
                     .arg("-setsecurewebproxy")
                     .arg(&service)
                     .arg("127.0.0.1")
-                    .arg("8080")
+                    .arg(http_port.to_string())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .status();
