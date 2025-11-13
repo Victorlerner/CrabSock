@@ -76,6 +76,32 @@ fn relaunch_elevated_with_args_macos(args: &[&str]) -> Result<(), String> {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn macos_tun_routes_ready() -> bool {
+    use std::process::Command;
+    if let Ok(out) = Command::new("netstat").args(["-rn", "-f", "inet"]).output() {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout).to_string();
+            let mut has_utun_default = false;
+            let mut has_half_0 = false;
+            let mut has_half_128 = false;
+            for line in text.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() < 7 { continue; }
+                let dest = parts[0];
+                let netif = parts[6];
+                if netif.starts_with("utun") {
+                    if dest == "default" { has_utun_default = true; }
+                    if dest == "0/1" || dest == "0.0.0.0/1" { has_half_0 = true; }
+                    if dest == "128/1" || dest == "128.0.0.0/1" { has_half_128 = true; }
+                }
+            }
+            return has_utun_default || (has_half_0 && has_half_128);
+        }
+    }
+    false
+}
+
 #[cfg(target_os = "windows")]
 fn relaunch_elevated_with_args(args: &[&str]) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -206,7 +232,16 @@ pub async fn ensure_admin_for_tun() -> Result<bool, String> {
         // Advise frontend to let this instance exit; elevated one will start
         Ok(false)
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
+    {
+        if is_root_macos() { return Ok(true); }
+        // Relaunch elevated via AppleScript (admin privileges) passing routing override
+        relaunch_elevated_with_args_macos(&["--elevated-relaunch", "--set-routing=tun"])
+            .map_err(|e| format!("Failed to request admin privileges: {}", e))?;
+        // The elevated instance will start separately; this one should exit
+        Ok(false)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         Ok(true)
     }
@@ -258,8 +293,8 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
     match result {
         Ok(_) => {
             log::info!("[CONNECT] VPN proxy started successfully");
-            // Export remote server host/port for TUN route exclusions (Windows)
-            #[cfg(target_os = "windows")]
+            // Export remote server host/port for TUN route exclusions (Windows/macOS)
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
             {
                 // Common route exclusion (for any upstream)
                 std::env::set_var("SS_REMOTE_HOST", config.server.clone());
@@ -267,7 +302,13 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                 // Export outbound params for sing-box TUN integration
                 match config.proxy_type {
                     crate::config::ProxyType::VLESS => {
+                        // Clear SS env to avoid stale values affecting TUN config
+                        std::env::remove_var("SB_SS_SERVER");
+                        std::env::remove_var("SB_SS_PORT");
+                        std::env::remove_var("SB_SS_METHOD");
+                        std::env::remove_var("SB_SS_PASSWORD");
                         std::env::set_var("SB_OUTBOUND_TYPE", "vless");
+                        std::env::remove_var("ACL_HTTP_PORT"); // use default 8080 for sing-box http inbound
                         std::env::set_var("SB_VLESS_SERVER", &config.server);
                         std::env::set_var("SB_VLESS_PORT", config.port.to_string());
                         if let Some(uuid) = &config.uuid { std::env::set_var("SB_VLESS_UUID", uuid); }
@@ -280,14 +321,42 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                         if let Some(spx) = &config.reality_spx { std::env::set_var("SB_VLESS_SPX", spx); }
                     }
                     crate::config::ProxyType::Shadowsocks => {
+                        // Clear VLESS env to avoid stale values affecting TUN config
+                        std::env::remove_var("SB_VLESS_SERVER");
+                        std::env::remove_var("SB_VLESS_PORT");
+                        std::env::remove_var("SB_VLESS_UUID");
+                        std::env::remove_var("SB_VLESS_SECURITY");
+                        std::env::remove_var("SB_VLESS_SNI");
+                        std::env::remove_var("SB_VLESS_FP");
+                        std::env::remove_var("SB_VLESS_FLOW");
+                        std::env::remove_var("SB_VLESS_PBK");
+                        std::env::remove_var("SB_VLESS_SID");
+                        std::env::remove_var("SB_VLESS_SPX");
                         // For TUN use sing-box outbound=shadowsocks directly to upstream
                         std::env::set_var("SB_OUTBOUND_TYPE", "shadowsocks");
+                             // Use a non-conflicting HTTP port for ACL proxy when SS is active
+                            std::env::set_var("ACL_HTTP_PORT", "9080");
                         std::env::set_var("SB_SS_SERVER", &config.server);
                         std::env::set_var("SB_SS_PORT", config.port.to_string());
                         if let Some(method) = &config.method { std::env::set_var("SB_SS_METHOD", method); }
                         if let Some(password) = &config.password { std::env::set_var("SB_SS_PASSWORD", password); }
                     }
                     _ => {
+                        // Clear both env groups; fall back to socks (local)
+                        std::env::remove_var("SB_VLESS_SERVER");
+                        std::env::remove_var("SB_VLESS_PORT");
+                        std::env::remove_var("SB_VLESS_UUID");
+                        std::env::remove_var("SB_VLESS_SECURITY");
+                        std::env::remove_var("SB_VLESS_SNI");
+                        std::env::remove_var("SB_VLESS_FP");
+                        std::env::remove_var("SB_VLESS_FLOW");
+                        std::env::remove_var("SB_VLESS_PBK");
+                        std::env::remove_var("SB_VLESS_SID");
+                        std::env::remove_var("SB_VLESS_SPX");
+                        std::env::remove_var("SB_SS_SERVER");
+                        std::env::remove_var("SB_SS_PORT");
+                        std::env::remove_var("SB_SS_METHOD");
+                        std::env::remove_var("SB_SS_PASSWORD");
                         std::env::set_var("SB_OUTBOUND_TYPE", "socks");
                     }
                 }
@@ -329,6 +398,8 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                     println!("[STDOUT] Sending ip_verified event to frontend: ip={}, country={:?}", 
                         ip_info.ip, ip_info.country);
                     
+                    // Сохраняем базовый IP для последующей проверки смены при TUN
+                    let baseline_ip = ip_info.ip.clone();
                     let ip_result = window.emit("ip_verified", ip_info);
                     
                     match ip_result {
@@ -348,7 +419,74 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                             println!("[STDOUT] ROUTING: Applying mode TUN");
                             // Clear system proxy on all platforms when switching to TUN
                             let _ = clear_system_proxy().await;
-                            if let Err(e) = enable_tun_mode().await { log::warn!("[CONNECT] Failed to enable TUN mode automatically: {}", e); }
+                            if let Err(e) = enable_tun_mode().await {
+                                let msg = e.to_string();
+                                #[cfg(target_os = "macos")]
+                                {
+                                    if msg.to_lowercase().contains("permit") || msg.to_lowercase().contains("priv") || !is_root_macos() {
+                                        log::warn!("[CONNECT][macOS] TUN requires admin privileges. Requesting elevation and relaunch.");
+                                        // Best-effort: trigger elevation relaunch to TUN mode; frontend can exit this instance
+                                        if let Err(e2) = relaunch_elevated_with_args_macos(&["--elevated-relaunch", "--set-routing=tun"]) {
+                                            log::error!("[CONNECT][macOS] Elevation failed: {}", e2);
+                                        }
+                                        // Do not fallback silently; keep current network unchanged
+                                        return Err("TUN requires admin privileges; relaunching elevated".into());
+                                    }
+                                }
+                                // Non-macOS or non-permission error: fallback to SystemProxy
+                                log::warn!("[CONNECT] Failed to enable TUN mode automatically: {}. Falling back to SystemProxy.", msg);
+                                let _ = disable_tun_mode().await;
+                                let proxy_settings = ProxySettings::with_socks5("127.0.0.1", 1080);
+                                let mut system_manager = SYSTEM_PROXY_MANAGER.lock().await;
+                                let _ = system_manager.set_system_proxy(&proxy_settings).await;
+                                log::info!("[CONNECT] Fallback to SystemProxy applied");
+                            } else {
+                                // TUN enabled; on macOS validate external IP changed, otherwise fallback automatically
+                                #[cfg(target_os = "macos")]
+                                {
+                                    let window_clone = window.clone();
+                                    let baseline = baseline_ip.clone();
+                                    tauri::async_runtime::spawn(async move {
+                                        // Ждем готовности маршрутов (до ~20s), не просто по времени, а по таблице маршрутизации
+                                        let mut ready = false;
+                                        for _ in 0..40 {
+                                            if macos_tun_routes_ready() {
+                                                ready = true;
+                                                break;
+                                            }
+                                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                        }
+                                        if !ready {
+                                            log::warn!("[ROUTING][macOS] TUN routes not detected in time. Falling back to SystemProxy.");
+                                            let _ = disable_tun_mode().await;
+                                            let proxy_settings = ProxySettings::with_socks5("127.0.0.1", 1080);
+                                            let mut system_manager = SYSTEM_PROXY_MANAGER.lock().await;
+                                            let _ = system_manager.set_system_proxy(&proxy_settings).await;
+                                            let _ = window_clone.emit("status", StatusEvent { status: "connected".into() });
+                                            return;
+                                        }
+                                        // После готовности маршрутов проверяем смену IP (даём до ~10s)
+                                        for _ in 0..20 {
+                                            match get_ip().await {
+                                                Ok(info2) => {
+                                                    if !baseline.is_empty() && info2.ip != baseline {
+                                                        log::info!("[ROUTING][macOS] TUN routes ready and external IP changed to {}", info2.ip);
+                                                        return;
+                                                    }
+                                                }
+                                                Err(e) => log::warn!("[ROUTING][macOS] IP check after TUN failed: {}", e),
+                                            }
+                                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                        }
+                                        log::warn!("[ROUTING][macOS] TUN routes ready but IP unchanged. Applying fallback to SystemProxy.");
+                                        let _ = disable_tun_mode().await;
+                                        let proxy_settings = ProxySettings::with_socks5("127.0.0.1", 1080);
+                                        let mut system_manager = SYSTEM_PROXY_MANAGER.lock().await;
+                                        let _ = system_manager.set_system_proxy(&proxy_settings).await;
+                                        let _ = window_clone.emit("status", StatusEvent { status: "connected".into() });
+                                    });
+                                }
+                            }
                         }
                         RoutingMode::SystemProxy => {
                             log::info!("[ROUTING] Applying routing mode: SystemProxy");
@@ -360,6 +498,10 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                             let mut system_manager = SYSTEM_PROXY_MANAGER.lock().await;
                             if let Err(e) = system_manager.set_system_proxy(&proxy_settings).await {
                                 log::warn!("[CONNECT] Failed to set system proxy automatically: {}", e);
+                            }
+                            // Note: macOS HTTP/HTTPS will follow ACL_HTTP_PORT (env) inside SystemProxyManager
+                            if let Ok(p) = std::env::var("ACL_HTTP_PORT") {
+                                log::info!("[ROUTING] SystemProxy HTTP port (ACL_HTTP_PORT) = {}", p);
                             }
                         }
                     }
@@ -414,6 +556,8 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                                     let manager = PROXY_MANAGER.lock().await;
                                     manager.mark_connected().await;
                                 }
+                                // Capture baseline IP before routing changes
+                                let baseline_ip = ip_info.ip.clone();
                                 let _ = window.emit("ip_verified", ip_info);
                                 let settings = ConfigManager::new().map_err(|e| e.to_string())?.load_configs().await.map_err(|e| e.to_string())?.settings;
                                 match settings.routing_mode {
@@ -421,7 +565,72 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                                         log::info!("[ROUTING] Applying routing mode: TUN");
                                         println!("[STDOUT] ROUTING: Applying mode TUN");
                                         let _ = clear_system_proxy().await;
-                                        if let Err(e) = enable_tun_mode().await { log::warn!("[CONNECT] Failed to enable TUN mode automatically: {}", e); }
+                                        if let Err(e) = enable_tun_mode().await {
+                                            let msg = e.to_string();
+                                            #[cfg(target_os = "macos")]
+                                            {
+                                                if msg.to_lowercase().contains("permit") || msg.to_lowercase().contains("priv") || !is_root_macos() {
+                                                    log::warn!("[CONNECT][macOS] TUN requires admin privileges. Requesting elevation and relaunch.");
+                                                    if let Err(e2) = relaunch_elevated_with_args_macos(&["--elevated-relaunch", "--set-routing=tun"]) {
+                                                        log::error!("[CONNECT][macOS] Elevation failed: {}", e2);
+                                                    }
+                                                    return Err("TUN requires admin privileges; relaunching elevated".into());
+                                                }
+                                            }
+                                            log::warn!("[CONNECT] Failed to enable TUN mode automatically: {}. Falling back to SystemProxy.", msg);
+                                            let _ = disable_tun_mode().await;
+                                            let proxy_settings = ProxySettings::with_socks5("127.0.0.1", 1080);
+                                            let mut system_manager = SYSTEM_PROXY_MANAGER.lock().await;
+                                            let _ = system_manager.set_system_proxy(&proxy_settings).await;
+                                            log::info!("[CONNECT] Fallback to SystemProxy applied");
+                                        } else {
+                                            // TUN enabled; on macOS validate external IP changed, otherwise fallback automatically
+                                            #[cfg(target_os = "macos")]
+                                            {
+                                                let window_clone = window.clone();
+                                                let baseline = baseline_ip.clone();
+                                                tauri::async_runtime::spawn(async move {
+                                                    tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
+                                        // Ждем готовности маршрутов (до ~20s)
+                                        let mut ready = false;
+                                        for _ in 0..40 {
+                                            if macos_tun_routes_ready() {
+                                                ready = true;
+                                                break;
+                                            }
+                                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                        }
+                                        if !ready {
+                                            log::warn!("[ROUTING][macOS] TUN routes not detected in time. Falling back to SystemProxy.");
+                                            let _ = disable_tun_mode().await;
+                                            let proxy_settings = ProxySettings::with_socks5("127.0.0.1", 1080);
+                                            let mut system_manager = SYSTEM_PROXY_MANAGER.lock().await;
+                                            let _ = system_manager.set_system_proxy(&proxy_settings).await;
+                                            let _ = window_clone.emit("status", StatusEvent { status: "connected".into() });
+                                            return;
+                                        }
+                                        // После готовности маршрутов проверяем смену IP (даём до ~10s)
+                                        for _ in 0..20 {
+                                            match get_ip().await {
+                                                Ok(info2) => {
+                                                    if !baseline.is_empty() && info2.ip != baseline {
+                                                        log::info!("[ROUTING][macOS] TUN routes ready and external IP changed to {}", info2.ip);
+                                                        return;
+                                                    }
+                                                }
+                                                Err(e) => log::warn!("[ROUTING][macOS] IP check after TUN failed: {}", e),
+                                            }
+                                            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                                        }
+                                        log::warn!("[ROUTING][macOS] TUN routes ready but IP unchanged. Applying fallback to SystemProxy.");
+                                        let _ = disable_tun_mode().await;
+                                        let proxy_settings = ProxySettings::with_socks5("127.0.0.1", 1080);
+                                        let mut system_manager = SYSTEM_PROXY_MANAGER.lock().await;
+                                        let _ = system_manager.set_system_proxy(&proxy_settings).await;
+                                        let _ = window_clone.emit("status", StatusEvent { status: "connected".into() });
+                                                });
+                                            }
+                                        }
                                     }
                                     RoutingMode::SystemProxy => {
                                         log::info!("[ROUTING] Applying routing mode: SystemProxy");

@@ -8,6 +8,7 @@ use tokio::task::JoinHandle;
 #[cfg(target_os = "windows")]
 #[allow(unused_imports)]
 use std::os::windows::process::CommandExt;
+use crate::singbox::runner::{find_singbox_path, spawn_singbox};
 
 pub struct VlessClient {
     config: ProxyConfig,
@@ -46,6 +47,11 @@ impl VlessClient {
         let reality_public_key = self.config.reality_public_key.clone().unwrap_or_default();
         let reality_short_id = self.config.reality_short_id.clone().unwrap_or_default();
 
+        log::info!(
+            "[VLESS] Config summary: server={} port={} tls={} sni={} fp={} flow={} net={} ws_path={}",
+            server, port, tls_enabled, sni, fingerprint, flow, network, ws_path
+        );
+
         let mut outbound = serde_json::json!({
             "type": "vless",
             "server": server,
@@ -79,8 +85,9 @@ impl VlessClient {
         }
 
         // Provide both HTTP (for WinINET/system proxy) and SOCKS inbounds
+        let sb_log_level = std::env::var("SB_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
         serde_json::json!({
-            "log": { "level": "info" },
+            "log": { "level": sb_log_level, "timestamp": true },
             "inbounds": [
                 { "type": "http",  "listen": "127.0.0.1", "listen_port": 8080, "sniff": true },
                 { "type": "socks", "listen": "127.0.0.1", "listen_port": 1080, "sniff": true, "sniff_override_destination": true }
@@ -90,16 +97,7 @@ impl VlessClient {
     }
 
     fn resolve_singbox_path() -> std::path::PathBuf {
-        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                candidates.push(dir.join("sing-box.exe"));
-                candidates.push(dir.join("resources").join("sing-box").join("sing-box.exe"));
-                candidates.push(dir.join("resources").join("sing-box.exe"));
-            }
-        }
-        candidates.push(std::path::PathBuf::from("./src-tauri/resources/sing-box/sing-box.exe"));
-        candidates.into_iter().find(|p| p.exists()).unwrap_or_else(|| std::path::PathBuf::from("sing-box.exe"))
+        find_singbox_path().unwrap_or_else(|| std::path::PathBuf::from("sing-box"))
     }
 }
 
@@ -164,15 +162,11 @@ impl ProxyClient for VlessClient {
         log::info!("[VLESS] Starting sing-box: {:?} -c {}", sb_path, cfg_path.display());
 
         // Initial spawn
-        let mut cmd = tokio::process::Command::new(&sb_path);
-        cmd.arg("run").arg("-c").arg(&cfg_path);
-        #[cfg(target_os = "windows")]
-        { cmd.creation_flags(0x08000000); }
-        cmd.kill_on_drop(true);
-        cmd.stdout(std::process::Stdio::null());
-        cmd.stderr(std::process::Stdio::null());
-
-        let child = cmd.spawn().map_err(|e| VpnError::ConnectionFailed(format!("Failed to start sing-box: {}", e)))?;
+        let child = spawn_singbox(&sb_path, &cfg_path)
+            .map_err(|e| VpnError::ConnectionFailed(format!("Failed to start sing-box: {}", e)))?;
+        if let Some(pid) = child.id() {
+            log::info!("[VLESS] sing-box PID={}", pid);
+        }
         // Track in both legacy and supervised holders
         self.child = Some(child);
         if self.child.is_some() {
@@ -204,7 +198,10 @@ impl ProxyClient for VlessClient {
                     let mut g = supervised.lock().await;
                     if let Some(mut ch) = g.take() {
                         // Wait for process to exit
-                        let _ = ch.wait().await;
+                        match ch.wait().await {
+                            Ok(status) => log::warn!("[VLESS] sing-box exited with status: {}", status),
+                            Err(e) => log::warn!("[VLESS] sing-box wait error: {}", e),
+                        }
                         // proceed to respawn unless stopping
                         !stop_flag.load(Ordering::SeqCst)
                     } else {
@@ -221,19 +218,13 @@ impl ProxyClient for VlessClient {
                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
 
                 // Spawn new sing-box
-                let mut cmd = tokio::process::Command::new(&sb_path_cloned);
-                cmd.arg("run").arg("-c").arg(&cfg_path_cloned);
-                #[cfg(target_os = "windows")]
-                { cmd.creation_flags(0x08000000); }
-                cmd.kill_on_drop(true);
-                cmd.stdout(std::process::Stdio::null());
-                cmd.stderr(std::process::Stdio::null());
-                match cmd.spawn() {
+                match spawn_singbox(&sb_path_cloned, &cfg_path_cloned) {
                     Ok(ch) => {
                         let mut g = supervised.lock().await;
                         *g = Some(ch);
                         // reset backoff after successful spawn
                         backoff_ms = 1000;
+                        log::info!("[VLESS] sing-box restarted");
                     }
                     Err(e) => {
                         log::error!("[VLESS] sing-box restart failed: {}", e);

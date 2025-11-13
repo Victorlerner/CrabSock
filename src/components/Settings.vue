@@ -16,7 +16,7 @@ function detectPlatform(): 'windows' | 'linux' | 'macos' | 'unknown' {
 
 const options = computed(() => {
   if (osPlatform.value === 'macos') {
-    return [ { label: 'System Proxy', value: 'systemproxy' as const } ]
+    return [ { label: 'System Proxy', value: 'systemproxy' as const }, { label: 'TUN (Kernel)', value: 'tun' as const } ]
   }
   if (osPlatform.value === 'linux') {
     return [ { label: 'TUN (Kernel)', value: 'tun' as const } ]
@@ -69,7 +69,7 @@ onMounted(init)
       <div>
         <div class="text-sm font-medium">Routing mode</div>
         <div class="text-xs text-gray-500 dark:text-gray-400">
-          <span v-if="osPlatform==='macos'">macOS: System Proxy only</span>
+          <span v-if="osPlatform==='macos'">macOS: System Proxy or TUN</span>
           <span v-else-if="osPlatform==='linux'">Linux: TUN only</span>
           <span v-else>Windows: System Proxy by default</span>
         </div>

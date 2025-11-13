@@ -3,6 +3,7 @@ name = "crab-sock"
 version = "0.1.0"
 edition = "2021"
 exclude = ["pkg/*", "pkg/**"]
+license = "Apache-2.0"
 
 [lib]
 name = "crab_sock"

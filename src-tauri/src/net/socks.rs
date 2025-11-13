@@ -3,12 +3,15 @@ use tokio::time::{timeout, Duration};
 
 pub async fn ensure_socks_ready(host: &str, port: u16) -> anyhow::Result<()> {
     let addr = (host, port);
+    log::info!("[SOCKS] Waiting for local SOCKS at {}:{}", host, port);
     for _ in 0..20 {
         if let Ok(Ok(_)) = timeout(Duration::from_millis(250), TcpStream::connect(addr)).await {
+            log::info!("[SOCKS] Local SOCKS is ready at {}:{}", host, port);
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
+    log::warn!("[SOCKS] Local SOCKS endpoint {}:{} not reachable in time", host, port);
     Err(anyhow::anyhow!(format!("Local SOCKS endpoint {}:{} not reachable", host, port)))
 }
 
@@ -20,10 +23,17 @@ pub fn get_socks_endpoint() -> (String, u16) {
         let hostport = hostport.split('/').next().unwrap_or(hostport);
         let mut parts = hostport.rsplitn(2, ':');
         if let (Some(port_s), Some(host)) = (parts.next(), parts.next()) {
-            if let Ok(port) = port_s.parse::<u16>() { return (host.to_string(), port); }
+            if let Ok(port) = port_s.parse::<u16>() {
+                log::info!("[SOCKS] Using endpoint from SOCKS_PROXY: {}:{}", host, port);
+                return (host.to_string(), port);
+            }
         }
-        if !hostport.is_empty() { return (hostport.to_string(), 1080); }
+        if !hostport.is_empty() {
+            log::info!("[SOCKS] Using endpoint from SOCKS_PROXY host only: {}:1080", hostport);
+            return (hostport.to_string(), 1080);
+        }
     }
+    log::info!("[SOCKS] Using default endpoint 127.0.0.1:1080");
     ("127.0.0.1".to_string(), 1080)
 }
 

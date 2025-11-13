@@ -25,8 +25,12 @@
   "bundle": {
     "active": true,
     "targets": ["deb", "rpm", "app", "dmg","msi"],
+    "macOS": {
+      "entitlements": "macos/host.entitlements"
+    },
     "resources": [
       "resources/sing-box/sing-box.exe",
+      "resources/sing-box/darwin/sing-box",
       "resources/openvpn_win/openvpn_amd64",
       "resources/openvpn_win/openvpn_arm64",
       "resources/openvpn_macos/openvpn",

@@ -9,6 +9,7 @@ pub enum OutboundKind {
 
 pub fn make_from_env(socks_host: String, socks_port: u16) -> Box<dyn OutboundStrategy> {
     let outbound_type = std::env::var("SB_OUTBOUND_TYPE").unwrap_or_else(|_| "socks".to_string());
+    log::info!("[SING-BOX][OUTBOUND] Selected type from env SB_OUTBOUND_TYPE={}", outbound_type);
     match outbound_type.as_str() {
         "vless" => Box::new(VlessStrategy),
         "shadowsocks" => Box::new(ShadowsocksStrategy),
