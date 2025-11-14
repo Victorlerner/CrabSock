@@ -41,6 +41,7 @@ tun-tap = "0.1"
 tokio-tun = "0.15"
 rtnetlink = "0.14"
 ipnetwork = "0.20"
+libc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.52"

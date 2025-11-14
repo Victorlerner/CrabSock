@@ -12,6 +12,18 @@ use tauri::tray::{TrayIconBuilder, TrayIconEvent};
 use tauri::menu::{Menu, MenuItem};
 
 fn main() {
+    // On Linux disable WebKitGTK DMA-BUF renderer to avoid GPU/DRM permission issues when using capabilities/elevation
+    #[cfg(target_os = "linux")]
+    {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        // Increase RLIMIT_NOFILE to avoid EMFILE under TUN + proxy load
+        unsafe {
+            use libc::{rlimit, setrlimit, RLIMIT_NOFILE};
+            let lim = rlimit { rlim_cur: 262144, rlim_max: 262144 };
+            let _ = setrlimit(RLIMIT_NOFILE, &lim);
+        }
+    }
+
     // On Windows release builds: if launched from an existing console (cmd/powershell),
     // attach to it so stdout/stderr prints are visible. If started from Explorer, do nothing.
     #[cfg(all(windows, not(debug_assertions)))]
@@ -72,18 +84,31 @@ fn main() {
         let is_debug = cfg!(debug_assertions);
         let skip = std::env::var("CRABSOCK_SKIP_CAP_CHECK").is_ok();
         if !is_debug && !skip {
+            use crab_sock::linux_capabilities::{has_cap_net_admin_on, set_cap_net_admin_on_path_via_pkexec, set_cap_net_admin_on_path_via_sudo};
+            use crab_sock::singbox::runner::find_singbox_path;
+            // Ensure our own binary has cap
             if !has_cap_net_admin() {
                 log::info!("[MAIN] cap_net_admin is missing, attempting to set via pkexec/sudo");
                 match set_cap_net_admin_via_pkexec().or_else(|_| set_cap_net_admin_via_sudo()) {
                     Ok(_) => {
-                        log::info!("[MAIN] cap_net_admin successfully set on startup, restarting to apply capabilities");
+                        log::info!("[MAIN] cap_net_admin set on app; restarting to apply capabilities");
                         if let Ok(exe) = std::env::current_exe() {
                             let args: Vec<String> = std::env::args().skip(1).collect();
                             let _ = std::process::Command::new(exe).args(args).spawn();
                         }
                         std::process::exit(0);
                     }
-                    Err(e) => log::warn!("[MAIN] Failed to set cap_net_admin on startup: {}", e),
+                    Err(e) => log::warn!("[MAIN] Failed to set cap_net_admin on app: {}", e),
+                }
+            }
+            // Best-effort: also set capability on sing-box binary to allow TUN creation/config from child
+            if let Some(sb) = find_singbox_path() {
+                let sb_str = sb.to_string_lossy().to_string();
+                if !has_cap_net_admin_on(&sb_str) {
+                    match set_cap_net_admin_on_path_via_pkexec(&sb_str).or_else(|_| set_cap_net_admin_on_path_via_sudo(&sb_str)) {
+                        Ok(_) => log::info!("[MAIN] cap_net_admin set on sing-box binary"),
+                        Err(e) => log::warn!("[MAIN] Failed to set cap_net_admin on sing-box: {}", e),
+                    }
                 }
             }
         } else {

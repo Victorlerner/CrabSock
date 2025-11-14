@@ -810,6 +810,7 @@ dependencies = [
  "env_logger",
  "futures-util",
  "ipnetwork",
+ "libc",
  "log",
  "netstack-lwip",
  "once_cell",

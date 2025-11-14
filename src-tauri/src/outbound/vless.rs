@@ -26,7 +26,6 @@ impl OutboundStrategy for VlessStrategy {
                 "uuid": uuid,
                 "flow": flow,
                 "packet_encoding": "",
-                "domain_resolver": "dns-direct",
                 "tls": {
                     "enabled": true,
                     "server_name": sni,
