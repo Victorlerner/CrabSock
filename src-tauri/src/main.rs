@@ -4,8 +4,6 @@ use crab_sock::commands::*;
 use crab_sock::utils::init_logging;
 use crab_sock::config_manager::ConfigManager;
 use crab_sock::openvpn::OpenVpnManager;
-#[cfg(target_os = "linux")]
-use crab_sock::linux_capabilities::{has_cap_net_admin, set_cap_net_admin_via_pkexec, set_cap_net_admin_via_sudo};
 use tauri::Manager;
 use tauri::Emitter;
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
@@ -79,41 +77,10 @@ fn main() {
         }
     }
 
+    // На Linux sing-box запускается через pkexec wrapper - capabilities НЕ нужны
     #[cfg(target_os = "linux")]
     {
-        let is_debug = cfg!(debug_assertions);
-        let skip = std::env::var("CRABSOCK_SKIP_CAP_CHECK").is_ok();
-        if !is_debug && !skip {
-            use crab_sock::linux_capabilities::{has_cap_net_admin_on, set_cap_net_admin_on_path_via_pkexec, set_cap_net_admin_on_path_via_sudo};
-            use crab_sock::singbox::runner::find_singbox_path;
-            // Ensure our own binary has cap
-            if !has_cap_net_admin() {
-                log::info!("[MAIN] cap_net_admin is missing, attempting to set via pkexec/sudo");
-                match set_cap_net_admin_via_pkexec().or_else(|_| set_cap_net_admin_via_sudo()) {
-                    Ok(_) => {
-                        log::info!("[MAIN] cap_net_admin set on app; restarting to apply capabilities");
-                        if let Ok(exe) = std::env::current_exe() {
-                            let args: Vec<String> = std::env::args().skip(1).collect();
-                            let _ = std::process::Command::new(exe).args(args).spawn();
-                        }
-                        std::process::exit(0);
-                    }
-                    Err(e) => log::warn!("[MAIN] Failed to set cap_net_admin on app: {}", e),
-                }
-            }
-            // Best-effort: also set capability on sing-box binary to allow TUN creation/config from child
-            if let Some(sb) = find_singbox_path() {
-                let sb_str = sb.to_string_lossy().to_string();
-                if !has_cap_net_admin_on(&sb_str) {
-                    match set_cap_net_admin_on_path_via_pkexec(&sb_str).or_else(|_| set_cap_net_admin_on_path_via_sudo(&sb_str)) {
-                        Ok(_) => log::info!("[MAIN] cap_net_admin set on sing-box binary"),
-                        Err(e) => log::warn!("[MAIN] Failed to set cap_net_admin on sing-box: {}", e),
-                    }
-                }
-            }
-        } else {
-            log::info!("[MAIN] Skipping capability setup (debug build or CRABSOCK_SKIP_CAP_CHECK set)");
-        }
+        log::info!("[MAIN][LINUX] TUN mode will use pkexec wrapper - no capability setup needed");
     }
 
     // Инициализируем конфиги при старте приложения

@@ -172,28 +172,68 @@ pub fn spawn_singbox(singbox_path: &Path, cfg_path: &Path) -> Result<tokio::proc
 
 #[cfg(target_os = "linux")]
 pub fn spawn_singbox(singbox_path: &Path, cfg_path: &Path) -> Result<tokio::process::Child> {
-    // Ensure exec bit on packaged binary (best-effort)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = std::fs::metadata(&singbox_path) {
-            let mut perm = meta.permissions();
-            let mode = perm.mode();
-            let target = mode | 0o111;
-            if target != mode {
-                perm.set_mode(target);
-                let _ = std::fs::set_permissions(&singbox_path, perm);
+    use std::os::unix::fs::PermissionsExt;
+    
+    // КРИТИЧНО: Запускаем sing-box через pkexec wrapper (как в nekoray)
+    // Это позволяет auto_route работать БЕЗ дополнительных запросов пароля
+    
+    // Найти wrapper скрипт
+    let wrapper_path = if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let mut candidates: Vec<PathBuf> = Vec::new();
+            candidates.push(exe_dir.join("resources").join("singbox-wrapper.sh"));
+            if let Some(parent) = exe_dir.parent() {
+                if let Some(grandparent) = parent.parent() {
+                    candidates.push(grandparent.join("resources").join("singbox-wrapper.sh"));
+                    candidates.push(grandparent.join("src-tauri").join("resources").join("singbox-wrapper.sh"));
+                }
             }
+            candidates.into_iter().find(|p| p.exists())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    
+    let wrapper = wrapper_path.ok_or_else(|| anyhow::anyhow!("singbox-wrapper.sh not found"))?;
+    
+    // Убеждаемся что wrapper исполняемый
+    if let Ok(meta) = std::fs::metadata(&wrapper) {
+        let mut perm = meta.permissions();
+        perm.set_mode(0o755);
+        let _ = std::fs::set_permissions(&wrapper, perm);
+    }
+    
+    // Убеждаемся что sing-box исполняемый
+    if let Ok(meta) = std::fs::metadata(&singbox_path) {
+        let mut perm = meta.permissions();
+        let mode = perm.mode();
+        let target = mode | 0o111;
+        if target != mode {
+            perm.set_mode(target);
+            let _ = std::fs::set_permissions(&singbox_path, perm);
         }
     }
-    let mut child = Command::new(singbox_path)
-        .args(["run", "-c", cfg_path.to_string_lossy().as_ref(), "--disable-color"])
+    
+    log::info!("[SING-BOX][SPAWN][Linux] Starting via pkexec wrapper (one password prompt for all operations)");
+    
+    // Запускаем через pkexec bash wrapper (ОДИН запрос пароля!)
+    let mut child = Command::new("pkexec")
+        .args([
+            "bash",
+            wrapper.to_string_lossy().as_ref(),
+            singbox_path.to_string_lossy().as_ref(),
+            cfg_path.to_string_lossy().as_ref(),
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| anyhow::anyhow!(format!("Failed to start sing-box: {}", e)))?;
-    log::info!("[SING-BOX][SPAWN][Linux] Executed: {:?} run -c {}", singbox_path, cfg_path.display());
+        .map_err(|e| anyhow::anyhow!(format!("Failed to start sing-box via pkexec: {}", e)))?;
+    
+    log::info!("[SING-BOX][SPAWN][Linux] pkexec bash {} {} {}", 
+               wrapper.display(), singbox_path.display(), cfg_path.display());
 
     if let Some(stdout) = child.stdout.take() {
         tokio::spawn(async move {

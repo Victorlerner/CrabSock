@@ -3,11 +3,6 @@ use crate::proxy::{ProxyManager, ConnectionStatus};
 use crate::config_manager::{ConfigManager, ConfigFile, AppSettings, RoutingMode};
 use crate::system_proxy::{SystemProxyManager, ProxySettings};
 use crate::tun_manager::TunManager;
-use crate::linux_capabilities::has_cap_net_admin;
-#[cfg(target_os = "linux")]
-use crate::linux_capabilities::{set_cap_net_admin_via_pkexec, set_cap_net_admin_via_sudo, has_cap_net_admin_on, set_cap_net_admin_on_path_via_pkexec, set_cap_net_admin_on_path_via_sudo};
-#[cfg(target_os = "linux")]
-use crate::singbox::runner::find_singbox_path;
 #[cfg(target_os = "windows")]
 use crate::windows_firewall::ensure_firewall_rules_allow;
 use once_cell::sync::Lazy;
@@ -247,49 +242,9 @@ pub async fn ensure_admin_for_tun() -> Result<bool, String> {
     }
     #[cfg(target_os = "linux")]
     {
-        // Ensure both our binary and sing-box have cap_net_admin, since sing-box creates/configures TUN
-        let mut need_relaunch = false;
-        let mut last_err: Option<String> = None;
-
-        if !has_cap_net_admin() {
-            match set_cap_net_admin_via_pkexec().or_else(|_| set_cap_net_admin_via_sudo()) {
-                Ok(_) => need_relaunch = true,
-                Err(e) => last_err = Some(format!("setcap self failed: {}", e)),
-            }
-        }
-        if let Some(sb_path) = find_singbox_path() {
-            let sb_str = sb_path.to_string_lossy().to_string();
-            if !has_cap_net_admin_on(&sb_str) {
-                match set_cap_net_admin_on_path_via_pkexec(&sb_str).or_else(|_| set_cap_net_admin_on_path_via_sudo(&sb_str)) {
-                    Ok(_) => { /* no relaunch needed for sing-box file itself */ }
-                    Err(e) => {
-                        // If self was set but sing-box not, try fallback by relaunching later and allowing pkexec again
-                        last_err = Some(format!("setcap sing-box failed: {}", e));
-                    }
-                }
-            }
-        } else {
-            // No sing-box found yet; we can still proceed if self has cap; sing-box spawn will likely fail later without cap
-            log::warn!("[TUN][LINUX] sing-box binary not found during ensure_admin_for_tun; capabilities may be insufficient.");
-        }
-
-        if need_relaunch {
-            if let Ok(exe) = std::env::current_exe() {
-                let args: Vec<String> = std::env::args().skip(1).collect();
-                let mut new_args = Vec::with_capacity(args.len() + 2);
-                new_args.extend(args);
-                new_args.push("--elevated-relaunch".to_string());
-                new_args.push("--set-routing=tun".to_string());
-                let _ = std::process::Command::new(exe).args(new_args).spawn();
-                return Ok(false);
-            }
-            return Err("Failed to relaunch after setting capabilities".into());
-        }
-
-        // If after attempts we still miss self or sing-box cap, report
-        if !has_cap_net_admin() {
-            return Err(last_err.unwrap_or_else(|| "cap_net_admin still missing on app binary".into()));
-        }
+        // На Linux sing-box запускается через pkexec wrapper (как в nekoray)
+        // Права запрашиваются автоматически при старте TUN - capabilities НЕ нужны
+        log::info!("[TUN][LINUX] TUN will use pkexec wrapper - no pre-setup needed");
         Ok(true)
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
@@ -409,24 +364,12 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
         }
         // Clear system proxy before enabling TUN
         let _ = clear_system_proxy().await;
-        // Enable TUN now (will spawn sing-box)
-        if let Err(e) = enable_tun_mode().await {
+        // Enable TUN now (will spawn sing-box) - IP verification handled inside enable_tun_mode
+        if let Err(e) = enable_tun_mode(window.clone()).await {
             log::error!("[CONNECT][TUN] Failed to enable TUN: {}", e);
             return Err(e);
         }
-        // Small delay then IP verify without proxy
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        match get_ip().await {
-            Ok(ip_info) => {
-                let _ = window.emit("status", StatusEvent { status: "connected".into() });
-                let _ = window.emit("ip_verified", ip_info.clone());
-                log::info!("[CONNECT][TUN] IP verification: {} ({})", ip_info.ip, ip_info.country.as_deref().unwrap_or("Unknown"));
-            }
-            Err(e) => {
-                log::warn!("[CONNECT][TUN] IP verification failed: {}", e);
-                let _ = window.emit("status", StatusEvent { status: "connected".into() });
-            }
-        }
+        let _ = window.emit("status", StatusEvent { status: "connected".into() });
         return Ok(());
     }
 
@@ -564,7 +507,7 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                             println!("[STDOUT] ROUTING: Applying mode TUN");
                             // Clear system proxy on all platforms when switching to TUN
                             let _ = clear_system_proxy().await;
-                            if let Err(e) = enable_tun_mode().await {
+                            if let Err(e) = enable_tun_mode(window.clone()).await {
                                 let msg = e.to_string();
                                 #[cfg(target_os = "macos")]
                                 {
@@ -710,7 +653,7 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                                         log::info!("[ROUTING] Applying routing mode: TUN");
                                         println!("[STDOUT] ROUTING: Applying mode TUN");
                                         let _ = clear_system_proxy().await;
-                                        if let Err(e) = enable_tun_mode().await {
+                                        if let Err(e) = enable_tun_mode(window.clone()).await {
                                             let msg = e.to_string();
                                             #[cfg(target_os = "macos")]
                                             {
@@ -1135,7 +1078,7 @@ pub async fn get_settings() -> Result<AppSettings, String> {
 }
 
 #[tauri::command]
-pub async fn set_routing_mode(mode: String) -> Result<(), String> {
+pub async fn set_routing_mode(window: tauri::Window, mode: String) -> Result<(), String> {
     let manager = ConfigManager::new().map_err(|e| e.to_string())?;
     let mut file = manager.load_configs().await.map_err(|e| e.to_string())?;
     let new_mode = match mode.to_lowercase().as_str() { "tun" => RoutingMode::Tun, _ => RoutingMode::SystemProxy };
@@ -1157,7 +1100,7 @@ pub async fn set_routing_mode(mode: String) -> Result<(), String> {
                 // Switch to TUN: always clear system proxy so kernel routing dominates
                 log::info!("[ROUTING] Live-apply: enabling TUN (clearing system proxy)");
                 let _ = clear_system_proxy().await; // ignore errors
-                if let Err(e) = enable_tun_mode().await { log::warn!("[ROUTING] Live-apply TUN failed: {}", e); }
+                if let Err(e) = enable_tun_mode(window.clone()).await { log::warn!("[ROUTING] Live-apply TUN failed: {}", e); }
             }
             RoutingMode::SystemProxy => {
                 // Switch to System Proxy: disable TUN, set proxy
@@ -1255,7 +1198,7 @@ pub async fn clear_system_proxy() -> Result<(), String> {
 
 // Команды для управления TUN режимом
 #[tauri::command]
-pub async fn enable_tun_mode() -> Result<(), String> {
+pub async fn enable_tun_mode(window: tauri::Window) -> Result<(), String> {
     log::info!("[TUN] Enabling TUN mode");
     println!("[STDOUT] TUN mode enable requested");
     
@@ -1279,11 +1222,7 @@ pub async fn enable_tun_mode() -> Result<(), String> {
         ConnectionStatus::Connected | ConnectionStatus::Connecting if !allow_without_local_proxy => {
             println!("[STDOUT] VPN is connected, starting TUN interface");
             
-            // Сначала проверяем capability
-            let has_capability = has_cap_net_admin();
-            println!("[STDOUT] TUN capability check: {}", has_capability);
-            
-            // Запускаем TUN интерфейс
+            // Запускаем TUN интерфейс (через pkexec wrapper на Linux)
             let mut tun_manager = TUN_MANAGER.lock().await;
             match tun_manager.start().await {
                 Ok(_) => {
@@ -1302,6 +1241,19 @@ pub async fn enable_tun_mode() -> Result<(), String> {
                     
                     println!("[STDOUT] TUN mode enabled successfully - all traffic routed through VPN");
                     log::info!("[TUN] TUN mode enabled successfully");
+                    
+                    // Проверяем и отправляем обновленный IP на фронт
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    match get_ip().await {
+                        Ok(ip_info) => {
+                            log::info!("[TUN] IP verification: {} ({})", ip_info.ip, ip_info.country.as_deref().unwrap_or("Unknown"));
+                            let _ = window.emit("ip_verified", ip_info);
+                        }
+                        Err(e) => {
+                            log::warn!("[TUN] IP verification failed: {}", e);
+                        }
+                    }
+                    
                     Ok(())
                 }
                 Err(e) => {
@@ -1309,13 +1261,8 @@ pub async fn enable_tun_mode() -> Result<(), String> {
                     
                     // Проверяем, связана ли ошибка с правами
                     let error_msg = e.to_string();
-                    if error_msg.contains("permissions") || error_msg.contains("sudo") || error_msg.contains("capability") || error_msg.contains("Insufficient") {
-                        if has_capability {
-                            println!("[STDOUT] TUN capability is set but interface creation failed - this might be a development mode issue");
-                            Err("TUN capability is set but interface creation failed. This might be due to running in development mode. Please try building and running the release version.".to_string())
-                        } else {
-                            Err("TUN Mode requires administrator privileges. Please grant permissions first.".to_string())
-                        }
+                    if error_msg.contains("permissions") || error_msg.contains("sudo") || error_msg.contains("pkexec") {
+                        Err("TUN Mode requires administrator privileges (pkexec). Please grant permissions when prompted.".to_string())
                     } else {
                         Err(format!("Failed to start TUN interface: {}", e))
                     }
@@ -1330,8 +1277,6 @@ pub async fn enable_tun_mode() -> Result<(), String> {
             }
             // Прямой outbound: стартуем TUN без локального прокси
             println!("[STDOUT] Starting TUN interface without local proxy (direct outbound)");
-            let has_capability = has_cap_net_admin();
-            println!("[STDOUT] TUN capability check: {}", has_capability);
             let mut tun_manager = TUN_MANAGER.lock().await;
             match tun_manager.start().await {
                 Ok(_) => {
@@ -1346,17 +1291,26 @@ pub async fn enable_tun_mode() -> Result<(), String> {
                     }
                     println!("[STDOUT] TUN mode enabled successfully (direct outbound)");
                     log::info!("[TUN] TUN mode enabled successfully (direct outbound)");
+                    
+                    // Проверяем и отправляем обновленный IP на фронт
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    match get_ip().await {
+                        Ok(ip_info) => {
+                            log::info!("[TUN] IP verification: {} ({})", ip_info.ip, ip_info.country.as_deref().unwrap_or("Unknown"));
+                            let _ = window.emit("ip_verified", ip_info);
+                        }
+                        Err(e) => {
+                            log::warn!("[TUN] IP verification failed: {}", e);
+                        }
+                    }
+                    
                     Ok(())
                 }
                 Err(e) => {
                     println!("[STDOUT] Failed to start TUN interface: {}", e);
                     let error_msg = e.to_string();
-                    if error_msg.contains("permissions") || error_msg.contains("sudo") || error_msg.contains("capability") || error_msg.contains("Insufficient") {
-                        if has_capability {
-                            Err("TUN capability is set but interface creation failed. This might be due to running in development mode. Please try building and running the release version.".to_string())
-                        } else {
-                            Err("TUN Mode requires administrator privileges. Please grant permissions first.".to_string())
-                        }
+                    if error_msg.contains("permissions") || error_msg.contains("sudo") || error_msg.contains("pkexec") {
+                        Err("TUN Mode requires administrator privileges (pkexec). Please grant permissions when prompted.".to_string())
                     } else {
                         Err(format!("Failed to start TUN interface: {}", e))
                     }

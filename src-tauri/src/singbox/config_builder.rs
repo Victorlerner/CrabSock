@@ -50,7 +50,7 @@ pub fn build_singbox_config(cfg: &TunConfig, socks_host: String, socks_port: u16
     );
 
     let outbounds = make_from_env(socks_host, socks_port).build_outbounds();
-    
+
     // В sing-box 1.11+ не нужны специальные outbounds (dns, block),
     // вместо них используются rule actions
 
@@ -76,6 +76,9 @@ pub fn build_singbox_config(cfg: &TunConfig, socks_host: String, socks_port: u16
     // - Windows / macOS: используем более консервативную схему с полем `address`
     // - Linux: переходим на современную схему sing-box с `inet4_address`,
     //   чтобы быть ближе к nekoray и актуальной документации.
+    // TUN inbound - КЛЮЧЕВОЕ РЕШЕНИЕ для избежания множественных sudo запросов:
+    // Используем auto_route: true НО с gvisor stack
+    // gvisor делает routing в userspace, sing-box только создаст интерфейс (1 sudo запрос)
     let mut tun_inbound = json!({
         "type": "tun",
         "tag": "tun-in",
