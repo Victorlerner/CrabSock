@@ -406,11 +406,13 @@ impl OpenVpnManager {
         // Use stdout for logs; avoid redirecting to file so frontend receives live logs
         let args_with_log = args.clone();
 
-        // On Linux we try to use the setuid helper crabsock-openvpn-helper,
+        // On Linux we try to use the setuid helper crabsock-root-helper,
         // which executes the system openvpn with the same arguments.
         // If the helper is not installed, we try to install it via pkexec and the bundled installer script.
         #[cfg(target_os = "linux")]
         let (spawn_exe, used_helper_flag) = {
+            const ROOT_HELPER_VERSION: &str = "1";
+
             fn find_existing_helper() -> Option<PathBuf> {
                 use std::path::Path;
                 #[cfg(unix)]
@@ -433,15 +435,31 @@ impl OpenVpnManager {
                 // 1) next to the application binary (primary path in dev/packaged mode)
                 if let Ok(cur) = std::env::current_exe() {
                     if let Some(dir) = cur.parent() {
-                        candidates.push(dir.join("crabsock-openvpn-helper"));
+                        candidates.push(dir.join("crabsock-root-helper"));
                     }
                 }
                 // 2) system fallback, if installer already placed helper into /usr/local/bin
-                candidates.push(PathBuf::from("/usr/local/bin/crabsock-openvpn-helper"));
+                candidates.push(PathBuf::from("/usr/local/bin/crabsock-root-helper"));
 
-                candidates
-                    .into_iter()
-                    .find(|p| p.exists() && p.is_file() && is_suid_root(p))
+                for p in candidates {
+                    if !(p.exists() && p.is_file() && is_suid_root(&p)) {
+                        continue;
+                    }
+                    // Check helper version; if it does not match, treat as not installed.
+                    let out = std::process::Command::new(&p)
+                        .arg("version")
+                        .stdin(Stdio::null())
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::null())
+                        .output();
+                    if let Ok(o) = out {
+                        let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                        if v == ROOT_HELPER_VERSION {
+                            return Some(p);
+                        }
+                    }
+                }
+                None
             }
 
             if let Some(helper) = find_existing_helper() {
@@ -459,7 +477,7 @@ impl OpenVpnManager {
                 let install_result: Result<(), String> = (|| {
                     let cur = std::env::current_exe().map_err(|e| e.to_string())?;
                     let exe_dir = cur.parent().ok_or_else(|| "Failed to resolve exe dir".to_string())?;
-                    let helper_src = exe_dir.join("crabsock-openvpn-helper");
+                    let helper_src = exe_dir.join("crabsock-root-helper");
                     if !helper_src.exists() {
                         return Err(format!(
                             "Helper binary not found next to executable: {}",

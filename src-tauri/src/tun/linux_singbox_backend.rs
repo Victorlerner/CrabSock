@@ -68,27 +68,100 @@ impl LinuxSingBoxTun {
         // Take child only once
         let mut child = self.singbox_child.take();
         
-        // IMPORTANT: sing-box is started via pkexec bash wrapper (running as root)
-        // Normal kill will not work - need pkexec killall like in nekoray
-        log::info!("[TUN][LINUX] Killing sing-box via pkexec killall...");
-        
-        // Kill ALL sing-box processes via killall (as nekoray unconditional stop)
-        // SIGTERM for graceful shutdown
-        let output = tokio::process::Command::new("pkexec")
-            .args(["killall", "-TERM", "sing-box"])
-            .output()
-            .await;
+        // Prefer root helper (crabsock-root-helper) to stop sing-box; fallback to pkexec killall.
+        let output = tokio::task::spawn_blocking(|| {
+            use std::os::unix::fs::PermissionsExt;
+            use std::os::unix::prelude::MetadataExt;
+            use std::path::Path;
+            use std::process::Stdio as PStdio;
+
+            const ROOT_HELPER_VERSION: &str = "1";
+
+            fn is_suid_root(p: &Path) -> bool {
+                if let Ok(meta) = std::fs::metadata(p) {
+                    let mode = meta.permissions().mode();
+                    let uid = meta.uid();
+                    (mode & 0o4000) != 0 && uid == 0
+                } else {
+                    false
+                }
+            }
+
+            let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(dir) = exe.parent() {
+                    candidates.push(dir.join("crabsock-root-helper"));
+                }
+            }
+            candidates.push(std::path::PathBuf::from(
+                "/usr/local/bin/crabsock-root-helper",
+            ));
+
+            let helper = {
+                let mut chosen: Option<std::path::PathBuf> = None;
+                for p in candidates {
+                    if !(p.exists() && p.is_file() && is_suid_root(p.as_path())) {
+                        continue;
+                    }
+                    let out = std::process::Command::new(&p)
+                        .arg("version")
+                        .stdin(PStdio::null())
+                        .stdout(PStdio::piped())
+                        .stderr(PStdio::null())
+                        .output();
+                    if let Ok(o) = out {
+                        let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                        if v == ROOT_HELPER_VERSION {
+                            chosen = Some(p);
+                            break;
+                        }
+                    }
+                }
+                chosen
+            };
+
+            if let Some(h) = helper {
+                log::info!(
+                    "[TUN][LINUX] Stopping sing-box via root helper {} (singbox-kill)",
+                    h.display()
+                );
+                std::process::Command::new(&h)
+                    .arg("singbox-kill")
+                    .stdin(PStdio::null())
+                    .stdout(PStdio::piped())
+                    .stderr(PStdio::piped())
+                    .output()
+            } else {
+                log::info!(
+                    "[TUN][LINUX] Root helper not available, falling back to pkexec killall"
+                );
+                std::process::Command::new("pkexec")
+                    .args(["killall", "-TERM", "sing-box"])
+                    .stdin(PStdio::null())
+                    .stdout(PStdio::piped())
+                    .stderr(PStdio::piped())
+                    .output()
+            }
+        })
+        .await
+        .unwrap_or_else(|e| {
+            log::error!("[TUN][LINUX] spawn_blocking failed for sing-box stop: {}", e);
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "join error"))
+        });
         
         match output {
             Ok(out) if out.status.success() => {
-                log::info!("[TUN][LINUX] pkexec killall succeeded");
+                log::info!("[TUN][LINUX] sing-box stop command succeeded");
             }
             Ok(out) => {
-                log::warn!("[TUN][LINUX] pkexec killall returned {}: {}", 
-                          out.status, String::from_utf8_lossy(&out.stderr));
+                log::warn!(
+                    "[TUN][LINUX] sing-box stop command returned {}: {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr)
+                );
             }
             Err(e) => {
-                log::error!("[TUN][LINUX] Failed to execute pkexec killall: {}", e);
+                log::error!("[TUN][LINUX] Failed to execute sing-box stop command: {}", e);
             }
         }
         
