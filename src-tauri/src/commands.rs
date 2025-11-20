@@ -242,8 +242,8 @@ pub async fn ensure_admin_for_tun() -> Result<bool, String> {
     }
     #[cfg(target_os = "linux")]
     {
-        // На Linux sing-box запускается через pkexec wrapper (как в nekoray)
-        // Права запрашиваются автоматически при старте TUN - capabilities НЕ нужны
+        // On Linux sing-box is started via a pkexec wrapper (similar to nekoray)
+        // Privileges are requested automatically when TUN starts - capabilities are NOT required
         log::info!("[TUN][LINUX] TUN will use pkexec wrapper - no pre-setup needed");
         Ok(true)
     }
@@ -453,18 +453,18 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
             #[cfg(target_os = "windows")]
             if let Err(e) = ensure_firewall_rules_allow() { log::warn!("[CONNECT][WIN] firewall allow failed: {}", e); }
             
-            // Ждем немного, чтобы прокси успел запуститься
+            // Wait a bit so that the proxy has time to start
             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
             
-            // Проверяем IP для подтверждения работы прокси
+            // Check IP to confirm that the proxy works
             match get_ip().await {
                 Ok(ip_info) => {
                     log::info!("[CONNECT] IP verification successful: {} ({})", ip_info.ip, ip_info.country.as_ref().unwrap_or(&"Unknown".to_string()));
                     
-                    // Небольшая задержка перед отправкой события
+                    // Small delay before sending the event
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                     
-                    // Отправляем обычное событие статуса
+                    // Send regular status event
                     println!("[STDOUT] Sending status event to frontend: status=connected");
                     
                     let status_result = window.emit("status", StatusEvent {
@@ -476,17 +476,17 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                         Err(e) => println!("[STDOUT] Failed to send status event: {:?}", e),
                     }
                     
-                    // Помечаем прокси как Connected только после успешной проверки
+                    // Mark proxy as Connected only after successful verification
                     {
                         let manager = PROXY_MANAGER.lock().await;
                         manager.mark_connected().await;
                     }
 
-                    // Отправляем событие о верификации IP
+                    // Send IP verification event
                     println!("[STDOUT] Sending ip_verified event to frontend: ip={}, country={:?}", 
                         ip_info.ip, ip_info.country);
                     
-                    // Сохраняем базовый IP для последующей проверки смены при TUN
+                    // Save baseline IP for later change detection when TUN is enabled
                     let baseline_ip = ip_info.ip.clone();
                     let ip_result = window.emit("ip_verified", ip_info);
                     
@@ -495,7 +495,7 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                         Err(e) => println!("[STDOUT] Failed to send ip_verified event: {:?}", e),
                     }
                     
-                    // Применяем режим маршрутизации из настроек (по умолчанию SystemProxy)
+                    // Apply routing mode from settings (SystemProxy by default)
                     let settings = ConfigManager::new()
                         .map_err(|e| e.to_string())?
                         .load_configs().await
@@ -535,7 +535,7 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                                     let window_clone = window.clone();
                                     let baseline = baseline_ip.clone();
                                     tauri::async_runtime::spawn(async move {
-                                        // Ждем готовности маршрутов (до ~20s), не просто по времени, а по таблице маршрутизации
+                                        // Wait for routes to be ready (up to ~20s) by inspecting routing table, not just time
                                         let mut ready = false;
                                         for _ in 0..40 {
                                             if macos_tun_routes_ready() {
@@ -553,7 +553,7 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                                             let _ = window_clone.emit("status", StatusEvent { status: "connected".into() });
                                             return;
                                         }
-                                        // После готовности маршрутов проверяем смену IP (даём до ~10s)
+                                        // After routes are ready, verify IP change (give up to ~10s)
                                         for _ in 0..20 {
                                             match get_ip().await {
                                                 Ok(info2) => {
@@ -581,7 +581,7 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                             println!("[STDOUT] ROUTING: Applying mode SystemProxy");
                             // Ensure TUN is disabled if it was on
                             let _ = disable_tun_mode().await;
-                            // Устанавливаем системный прокси на наш локальный SOCKS5
+                            // Set system proxy to our local SOCKS5
                             let proxy_settings = ProxySettings::with_socks5("127.0.0.1", 1080);
                             let mut system_manager = SYSTEM_PROXY_MANAGER.lock().await;
                             if let Err(e) = system_manager.set_system_proxy(&proxy_settings).await {
@@ -605,7 +605,7 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                         manager.mark_error(e.clone()).await;
                     }
                     
-                    // Не включаем системный прокси/TUN при провале проверки IP, чтобы не ломать сеть
+                    // Do not enable system proxy/TUN on IP verification failure to avoid breaking network
                     let _ = window.emit("status", StatusEvent {
                         status: "connected".into(),
                     });
@@ -635,7 +635,7 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                     Ok(_) => {
                         log::info!("[CONNECT] Reconnect attempt started after seamless disconnect");
                         // fall through to the same success path by recursively verifying IP
-                        // Ждем немного, чтобы прокси успел запуститься
+                        // Wait a bit so that the proxy has time to start
                         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                         match get_ip().await {
                             Ok(ip_info) => {
@@ -679,7 +679,7 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                                                 let baseline = baseline_ip.clone();
                                                 tauri::async_runtime::spawn(async move {
                                                     tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
-                                        // Ждем готовности маршрутов (до ~20s)
+                                        // Wait for routes to be ready (up to ~20s)
                                         let mut ready = false;
                                         for _ in 0..40 {
                                             if macos_tun_routes_ready() {
@@ -697,7 +697,7 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                                             let _ = window_clone.emit("status", StatusEvent { status: "connected".into() });
                                             return;
                                         }
-                                        // После готовности маршрутов проверяем смену IP (даём до ~10s)
+                                        // After routes are ready, verify IP change (give up to ~10s)
                                         for _ in 0..20 {
                                             match get_ip().await {
                                                 Ok(info2) => {
@@ -765,7 +765,7 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
 pub async fn disconnect_vpn(window: tauri::Window) -> Result<(), String> {
     log::info!("[DISCONNECT] Disconnecting VPN");
 
-    // Сначала отключаем TUN и системный прокси. Делаем это в отдельной задаче, чтобы жесткий трафик мог завершиться корректно
+    // First disable TUN and system proxy. Do this in a separate task so that in-flight traffic can complete gracefully
     let tun_task = tauri::async_runtime::spawn(async move {
         let _ = disable_tun_mode().await;
     });
@@ -781,7 +781,7 @@ pub async fn disconnect_vpn(window: tauri::Window) -> Result<(), String> {
                 status: "disconnected".into(),
             });
 
-            let _ = tun_task.await; // дожидаемся выключения TUN
+            let _ = tun_task.await; // wait for TUN shutdown
             log::info!("[DISCONNECT] VPN disconnected");
             Ok(())
         }
@@ -848,7 +848,7 @@ pub async fn start_connection_monitoring(window: tauri::Window) -> Result<(), St
                 last_status = current_status.to_string();
             }
             
-            // Если подключены, проверяем IP каждые 30 секунд
+            // If connected, verify IP every 30 seconds
             if current_status == "connected" {
                 match get_ip().await {
                     Ok(ip_info) => {
@@ -870,8 +870,8 @@ pub async fn start_connection_monitoring(window: tauri::Window) -> Result<(), St
                     Err(e) => {
                         log::warn!("[MONITOR] IP check failed: {}", e);
                         println!("[STDOUT] Monitor: IP check failed: {}", e);
-                        // Если IP проверка не удалась несколько раз подряд, возможно подключение упало
-                        // Но пока не меняем статус автоматически
+                        // If IP verification fails several times in a row, the connection may be down,
+                        // but we do not change status automatically yet
                     }
                 }
             }
@@ -885,7 +885,7 @@ pub async fn start_connection_monitoring(window: tauri::Window) -> Result<(), St
 pub async fn get_ip() -> Result<IpInfo, String> {
     log::info!("[IP] Fetching external IP");
 
-    // Определяем текущий статус и режим маршрутизации, чтобы понять, использовать ли локальный SOCKS
+    // Determine current status and routing mode to decide whether to use local SOCKS
     let status = {
         let manager = PROXY_MANAGER.lock().await;
         manager.get_status().await
@@ -904,7 +904,7 @@ pub async fn get_ip() -> Result<IpInfo, String> {
         .timeout(std::time::Duration::from_secs(12))
         .no_proxy();
 
-    // Если SystemProxy — проверяем через локальный SOCKS, иначе (Tun/другое) — без прокси
+    // If SystemProxy — check via local SOCKS, otherwise (Tun/other) — without proxy
     let use_socks = matches!(status, ConnectionStatus::Connected | ConnectionStatus::Connecting)
         && matches!(routing_mode, RoutingMode::SystemProxy);
     let client = if use_socks {
@@ -919,12 +919,12 @@ pub async fn get_ip() -> Result<IpInfo, String> {
             .map_err(|e| format!("Failed to create HTTP client: {}", e))?
     };
 
-    // Набор публичных сервисов для получения IP. Идем по порядку, пока не получится.
+    // List of public services to obtain IP. Try in order until one succeeds.
     // 1) ipinfo.io — ip + country
     // 2) ipwho.is — ip + country_code
     // 3) ip-api.com — query + countryCode
-    // 4) api.ipify.org — только ip
-    // 5) icanhazip.com — только ip (text/plain)
+    // 4) api.ipify.org — IP only
+    // 5) icanhazip.com — IP only (text/plain)
     let mut last_error: Option<String> = None;
 
     // ipinfo.io
@@ -1040,7 +1040,7 @@ pub async fn get_ip() -> Result<IpInfo, String> {
     Err(last_error.unwrap_or_else(|| "Failed to fetch IP from all providers".to_string()))
 }
 
-// Команды для работы с конфигами
+// Commands for working with configs
 #[tauri::command]
 pub async fn load_configs() -> Result<ConfigFile, String> {
     log::info!("[CONFIG] Loading configs from file system");
@@ -1142,12 +1142,12 @@ pub async fn get_config_path() -> Result<String, String> {
     Ok(path)
 }
 
-// Команды для управления системным прокси
+// Commands for controlling system proxy
 #[tauri::command]
 pub async fn set_system_proxy() -> Result<(), String> {
     log::info!("[SYSTEM_PROXY] Enabling system proxy");
     
-    // Получаем текущий статус прокси
+    // Get current proxy status
     let status = {
         let manager = PROXY_MANAGER.lock().await;
         manager.get_status().await
@@ -1155,19 +1155,19 @@ pub async fn set_system_proxy() -> Result<(), String> {
 
     match status {
         ConnectionStatus::Connected => {
-            // Проверяем, включен ли TUN режим
+            // Check whether TUN mode is enabled
             let tun_mode = {
                 let system_manager = SYSTEM_PROXY_MANAGER.lock().await;
                 system_manager.is_tun_mode()
             };
 
             if tun_mode {
-                // Если включен TUN режим, просто включаем его
+                // If TUN mode is enabled, just enable it
                 let mut system_manager = SYSTEM_PROXY_MANAGER.lock().await;
                 system_manager.set_tun_mode(true).await
                     .map_err(|e| format!("Failed to enable TUN mode: {}", e))?;
             } else {
-                // Устанавливаем системный прокси на наш SOCKS5 прокси
+                // Set system proxy to our SOCKS5 proxy
                 let proxy_settings = ProxySettings::with_socks5("127.0.0.1", 1080);
                 
                 let mut system_manager = SYSTEM_PROXY_MANAGER.lock().await;
@@ -1196,19 +1196,19 @@ pub async fn clear_system_proxy() -> Result<(), String> {
     Ok(())
 }
 
-// Команды для управления TUN режимом
+// Commands for controlling TUN mode
 #[tauri::command]
 pub async fn enable_tun_mode(window: tauri::Window) -> Result<(), String> {
     log::info!("[TUN] Enabling TUN mode");
     println!("[STDOUT] TUN mode enable requested");
     
-    // Получаем текущий статус прокси
+    // Get current proxy status
     let status = {
         let manager = PROXY_MANAGER.lock().await;
         manager.get_status().await
     };
 
-    // Разрешаем TUN без локального прокси, если выставлен прямой outbound для sing-box
+    // Allow TUN without local proxy if a direct outbound for sing-box is configured
     let routing_mode = ConfigManager::new()
         .map_err(|e| e.to_string())?
         .load_configs().await
@@ -1222,13 +1222,13 @@ pub async fn enable_tun_mode(window: tauri::Window) -> Result<(), String> {
         ConnectionStatus::Connected | ConnectionStatus::Connecting if !allow_without_local_proxy => {
             println!("[STDOUT] VPN is connected, starting TUN interface");
             
-            // Запускаем TUN интерфейс (через pkexec wrapper на Linux)
+            // Start TUN interface (via pkexec wrapper on Linux)
             let mut tun_manager = TUN_MANAGER.lock().await;
             match tun_manager.start().await {
                 Ok(_) => {
                     println!("[STDOUT] TUN interface started successfully");
 
-                    // В TUN режиме на Windows системный прокси не включаем
+                    // In TUN mode on Windows we do not enable system proxy
                     #[cfg(not(target_os = "windows"))]
                     {
                         let mut system_manager = SYSTEM_PROXY_MANAGER.lock().await;
@@ -1242,7 +1242,7 @@ pub async fn enable_tun_mode(window: tauri::Window) -> Result<(), String> {
                     println!("[STDOUT] TUN mode enabled successfully - all traffic routed through VPN");
                     log::info!("[TUN] TUN mode enabled successfully");
                     
-                    // Проверяем и отправляем обновленный IP на фронт
+                    // Check and send updated IP to frontend
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                     match get_ip().await {
                         Ok(ip_info) => {
@@ -1259,7 +1259,7 @@ pub async fn enable_tun_mode(window: tauri::Window) -> Result<(), String> {
                 Err(e) => {
                     println!("[STDOUT] Failed to start TUN interface: {}", e);
                     
-                    // Проверяем, связана ли ошибка с правами
+                    // Check whether the error is related to permissions
                     let error_msg = e.to_string();
                     if error_msg.contains("permissions") || error_msg.contains("sudo") || error_msg.contains("pkexec") {
                         Err("TUN Mode requires administrator privileges (pkexec). Please grant permissions when prompted.".to_string())
@@ -1275,7 +1275,7 @@ pub async fn enable_tun_mode(window: tauri::Window) -> Result<(), String> {
                 println!("[STDOUT] {}", error_msg);
                 return Err(error_msg.to_string());
             }
-            // Прямой outbound: стартуем TUN без локального прокси
+            // Direct outbound: start TUN without local proxy
             println!("[STDOUT] Starting TUN interface without local proxy (direct outbound)");
             let mut tun_manager = TUN_MANAGER.lock().await;
             match tun_manager.start().await {
@@ -1292,7 +1292,7 @@ pub async fn enable_tun_mode(window: tauri::Window) -> Result<(), String> {
                     println!("[STDOUT] TUN mode enabled successfully (direct outbound)");
                     log::info!("[TUN] TUN mode enabled successfully (direct outbound)");
                     
-                    // Проверяем и отправляем обновленный IP на фронт
+                    // Check and send updated IP to frontend
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                     match get_ip().await {
                         Ok(ip_info) => {
@@ -1325,7 +1325,7 @@ pub async fn disable_tun_mode() -> Result<(), String> {
     log::info!("[TUN] Disabling TUN mode");
     println!("[STDOUT] TUN mode disable requested");
     
-    // Отключаем TUN режим в системном прокси менеджере
+    // Disable TUN mode in the system proxy manager
     let mut system_manager = SYSTEM_PROXY_MANAGER.lock().await;
     system_manager.set_tun_mode(false).await
         .map_err(|e| {
@@ -1335,7 +1335,7 @@ pub async fn disable_tun_mode() -> Result<(), String> {
 
     println!("[STDOUT] TUN mode disabled in system proxy manager");
 
-    // Останавливаем TUN интерфейс
+    // Stop TUN interface
     let mut tun_manager = TUN_MANAGER.lock().await;
     tun_manager.stop().await
         .map_err(|e| {

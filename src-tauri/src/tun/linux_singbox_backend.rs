@@ -34,13 +34,13 @@ impl LinuxSingBoxTun {
         let singbox_path = find_singbox_path()
             .ok_or_else(|| anyhow::anyhow!("sing-box not found in resources or alongside executable"))?;
         
-        // На Linux sing-box запускается через pkexec wrapper (как в nekoray)
-        // Это позволяет auto_route работать БЕЗ множественных запросов пароля
+        // On Linux sing-box is started via pkexec wrapper (similar to nekoray)
+        // This allows auto_route to work WITHOUT multiple password prompts
         log::info!("[TUN][LINUX] sing-box will run via pkexec (one password prompt)");
 
         let cfg_path = build_singbox_config(&self.config, socks_host, socks_port)?;
         
-        // Всегда логируем конфиг для отладки (можно отключить через LOG_SINGBOX_CONFIG=0)
+        // Always log config for debugging (can be disabled via LOG_SINGBOX_CONFIG=0)
         if std::env::var("LOG_SINGBOX_CONFIG").ok().as_deref() != Some("0") {
             if let Ok(cfg_text) = std::fs::read_to_string(&cfg_path) {
                 log::info!("[SING-BOX][CONFIG] Generated config:\n{}", cfg_text);
@@ -65,15 +65,15 @@ impl LinuxSingBoxTun {
         if !self.is_running { return Ok(()); }
         log::info!("[TUN][LINUX] Stopping sing-box...");
         
-        // Забираем child ОДИН РАЗ
+        // Take child only once
         let mut child = self.singbox_child.take();
         
-        // КРИТИЧНО: sing-box запущен через pkexec bash wrapper (работает под root)
-        // Обычный kill не сработает - нужен pkexec killall как в nekoray
+        // IMPORTANT: sing-box is started via pkexec bash wrapper (running as root)
+        // Normal kill will not work - need pkexec killall like in nekoray
         log::info!("[TUN][LINUX] Killing sing-box via pkexec killall...");
         
-        // Убиваем ВСЕ процессы sing-box через killall (как в nekoray unconditional stop)
-        // SIGTERM для graceful shutdown
+        // Kill ALL sing-box processes via killall (as nekoray unconditional stop)
+        // SIGTERM for graceful shutdown
         let output = tokio::process::Command::new("pkexec")
             .args(["killall", "-TERM", "sing-box"])
             .output()
@@ -92,7 +92,7 @@ impl LinuxSingBoxTun {
             }
         }
         
-        // Ждем завершения процесса pkexec/wrapper
+        // Wait for pkexec/wrapper process to exit
         if let Some(ref mut c) = child {
             log::info!("[TUN][LINUX] Waiting for wrapper to exit...");
             match tokio::time::timeout(std::time::Duration::from_secs(5), c.wait()).await {
@@ -110,7 +110,7 @@ impl LinuxSingBoxTun {
             }
         }
         
-        // Удаляем временный конфиг
+        // Remove temporary config
         if let Some(cfg) = self.temp_config.take() {
             let _ = std::fs::remove_file(cfg);
         }

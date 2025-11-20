@@ -77,13 +77,13 @@ fn main() {
         }
     }
 
-    // На Linux sing-box запускается через pkexec wrapper - capabilities НЕ нужны
+    // On Linux sing-box is started via pkexec wrapper - capabilities are NOT required
     #[cfg(target_os = "linux")]
     {
         log::info!("[MAIN][LINUX] TUN mode will use pkexec wrapper - no capability setup needed");
     }
 
-    // Инициализируем конфиги при старте приложения
+    // Initialize configs at application startup
     tauri::async_runtime::block_on(async {
         match ConfigManager::new() {
             Ok(config_manager) => {
@@ -123,9 +123,9 @@ fn main() {
 
     tauri::Builder::default()
         .setup(move |app| {
-            // Создаем трей-иконку и обрабатываем клики для показа окна
+            // Create tray icon and handle clicks to show window
             let icon = app.default_window_icon().cloned().expect("default window icon missing");
-            // Трей-меню
+            // Tray menu
             let show_item = MenuItem::with_id(app, "show", "Show app", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit app", true, None::<&str>)?;
             let menu = Menu::new(app)?;
@@ -139,14 +139,14 @@ fn main() {
                 .show_menu_on_left_click(true)
                 .on_tray_icon_event(|icon, event| {
                     match event {
-                        // ЛКМ открывает меню; даблклик показывает окно
+                        // Left click opens menu; double-click shows window
                         TrayIconEvent::DoubleClick { .. } => {
                             if let Some(win) = icon.app_handle().get_webview_window("main") {
                                 let _ = win.show();
                                 let _ = win.set_focus();
                             }
                         }
-                        TrayIconEvent::Click { .. } => { /* меню покажет сам таури */ }
+                        TrayIconEvent::Click { .. } => { /* Tauri will show menu itself */ }
                         _ => {}
                     }
                 })
@@ -159,7 +159,7 @@ fn main() {
                             }
                         }
                         "quit" => {
-                            // Грейсфул-шатдаун: сначала останавливаем прокси (убьёт sing-box), затем TUN и системный прокси
+                            // Graceful shutdown: first stop proxy (kills sing-box), then TUN and system proxy
                             let app = icon.app_handle().clone();
                             tauri::async_runtime::spawn(async move {
                                 // Stop proxy first (kills sing-box if running)
@@ -216,7 +216,7 @@ fn main() {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                // Сворачиваем в трей вместо выхода
+                // Minimize to tray instead of exiting
                 api.prevent_close();
                 let _ = window.hide();
             }

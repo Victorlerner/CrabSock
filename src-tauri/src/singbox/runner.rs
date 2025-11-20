@@ -174,10 +174,10 @@ pub fn spawn_singbox(singbox_path: &Path, cfg_path: &Path) -> Result<tokio::proc
 pub fn spawn_singbox(singbox_path: &Path, cfg_path: &Path) -> Result<tokio::process::Child> {
     use std::os::unix::fs::PermissionsExt;
     
-    // КРИТИЧНО: Запускаем sing-box через pkexec wrapper (как в nekoray)
-    // Это позволяет auto_route работать БЕЗ дополнительных запросов пароля
+    // IMPORTANT: run sing-box via pkexec wrapper (similar to nekoray)
+    // This allows auto_route to work WITHOUT multiple password prompts
     
-    // Найти wrapper скрипт
+    // Locate wrapper script
     let wrapper_path = if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe.parent() {
             let mut candidates: Vec<PathBuf> = Vec::new();
@@ -198,14 +198,14 @@ pub fn spawn_singbox(singbox_path: &Path, cfg_path: &Path) -> Result<tokio::proc
     
     let wrapper = wrapper_path.ok_or_else(|| anyhow::anyhow!("singbox-wrapper.sh not found"))?;
     
-    // Убеждаемся что wrapper исполняемый
+    // Ensure wrapper is executable
     if let Ok(meta) = std::fs::metadata(&wrapper) {
         let mut perm = meta.permissions();
         perm.set_mode(0o755);
         let _ = std::fs::set_permissions(&wrapper, perm);
     }
     
-    // Убеждаемся что sing-box исполняемый
+    // Ensure sing-box is executable
     if let Ok(meta) = std::fs::metadata(&singbox_path) {
         let mut perm = meta.permissions();
         let mode = perm.mode();
@@ -218,7 +218,7 @@ pub fn spawn_singbox(singbox_path: &Path, cfg_path: &Path) -> Result<tokio::proc
     
     log::info!("[SING-BOX][SPAWN][Linux] Starting via pkexec wrapper (one password prompt for all operations)");
     
-    // Запускаем через pkexec bash wrapper (ОДИН запрос пароля!)
+    // Start via pkexec bash wrapper (ONE password prompt!)
     let mut child = Command::new("pkexec")
         .args([
             "bash",

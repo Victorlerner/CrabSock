@@ -8,8 +8,8 @@ use crate::outbound::factory::make_from_env;
 pub fn build_singbox_config(cfg: &TunConfig, socks_host: String, socks_port: u16) -> Result<PathBuf> {
     use std::net::{IpAddr, ToSocketAddrs};
 
-    // Для Linux по умолчанию уменьшаем уровень логов sing-box до "warn",
-    // на других платформах оставляем "info". Всегда можно переопределить SB_LOG_LEVEL.
+    // For Linux we default sing-box log level to "warn",
+    // on other platforms we keep "info". Can be overridden via SB_LOG_LEVEL.
     let default_log_level = if cfg!(target_os = "linux") { "warn" } else { "info" };
     let sb_log_level =
         std::env::var("SB_LOG_LEVEL").unwrap_or_else(|_| default_log_level.to_string());
@@ -51,14 +51,14 @@ pub fn build_singbox_config(cfg: &TunConfig, socks_host: String, socks_port: u16
 
     let outbounds = make_from_env(socks_host, socks_port).build_outbounds();
 
-    // В sing-box 1.11+ не нужны специальные outbounds (dns, block),
-    // вместо них используются rule actions
+    // In sing-box 1.11+ we no longer need special outbounds (dns, block),
+    // rule actions are used instead.
 
-    // DNS Configuration для sing-box 1.12+
-    // Используем публичные DNS (8.8.8.8) через UDP - проще чем DoH и без петель
+    // DNS configuration for sing-box 1.12+:
+    // use public DNS (8.8.8.8) over UDP – simpler than DoH and without loops.
     let mut dns_rules: Vec<serde_json::Value> = Vec::new();
     
-    // Блокируем мусорные запросы
+    // Block unwanted DNS queries
     dns_rules.push(json!({ 
         "query_type": [32, 33], 
         "server": "dns-block",
@@ -72,13 +72,13 @@ pub fn build_singbox_config(cfg: &TunConfig, socks_host: String, socks_port: u16
 
     // Build TUN inbound.
     //
-    // Общая схема:
-    // - Windows / macOS: используем более консервативную схему с полем `address`
-    // - Linux: переходим на современную схему sing-box с `inet4_address`,
-    //   чтобы быть ближе к nekoray и актуальной документации.
-    // TUN inbound - КЛЮЧЕВОЕ РЕШЕНИЕ для избежания множественных sudo запросов:
-    // Используем auto_route: true НО с gvisor stack
-    // gvisor делает routing в userspace, sing-box только создаст интерфейс (1 sudo запрос)
+    // General scheme:
+    // - Windows / macOS: use a more conservative schema with `address` field
+    // - Linux: move to modern sing-box schema with `inet4_address`,
+    //   to be closer to nekoray and current documentation.
+    // TUN inbound is the KEY decision to avoid multiple sudo prompts:
+    // use auto_route: true BUT with gvisor stack.
+    // gvisor performs routing in userspace, sing-box only creates the interface (one sudo prompt).
     let mut tun_inbound = json!({
         "type": "tun",
         "tag": "tun-in",
@@ -149,11 +149,11 @@ pub fn build_singbox_config(cfg: &TunConfig, socks_host: String, socks_port: u16
             "auto_detect_interface": true,
             "final": "proxy",
             "rules": [
-                // DNS hijack - перехватываем все DNS запросы через TUN
+                // DNS hijack - intercept all DNS traffic through TUN
                 { "protocol": "dns", "action": "hijack-dns" },
-                // Локальные сети напрямую
+                // Local networks go directly
                 { "ip_cidr": direct_cidrs, "outbound": "direct" },
-                // Блокируем мусорные порты
+                // Block noisy/garbage ports
                 { "network": "udp", "port": [135,137,138,139,5353], "action": "reject" },
                 { "ip_cidr": ["224.0.0.0/3","ff00::/8"], "action": "reject" },
                 { "source_ip_cidr": ["224.0.0.0/3","ff00::/8"], "action": "reject" }

@@ -64,8 +64,8 @@ impl ShadowsocksClient {
         let server = Server::new(config).await
             .map_err(|e| format!("Failed to create server: {}", e))?;
         
-        // Запускаем сервер с таймаутом для предотвращения зависания
-        let server_timeout = Duration::from_secs(300); // 5 минут
+        // Start server with timeout to avoid hanging
+        let server_timeout = Duration::from_secs(300); // 5 minutes
         
         timeout(server_timeout, server.run()).await
             .map_err(|e| {

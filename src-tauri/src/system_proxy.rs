@@ -93,12 +93,12 @@ impl SystemProxyManager {
     pub async fn set_system_proxy(&mut self, settings: &ProxySettings) -> Result<()> {
         log::info!("[SYSTEM_PROXY] Setting system proxy: {:?}", settings);
 
-        // Сохраняем текущие настройки прокси
+        // Save current proxy settings
         if self.original_settings.is_none() {
             self.original_settings = Some(self.get_current_proxy_settings().await?);
         }
 
-        // Устанавливаем новые настройки прокси
+        // Apply new proxy settings
         self.set_proxy_settings(settings).await?;
 
         log::info!("[SYSTEM_PROXY] System proxy set successfully");
@@ -108,11 +108,11 @@ impl SystemProxyManager {
     pub async fn clear_system_proxy(&mut self) -> Result<()> {
         log::info!("[SYSTEM_PROXY] Clearing system proxy");
 
-        // Восстанавливаем оригинальные настройки
+        // Restore original settings
         if let Some(ref original) = self.original_settings {
             self.set_proxy_settings(original).await?;
         } else {
-            // Если оригинальных настроек нет, просто очищаем прокси
+            // If there were no original settings, just clear proxy
             let empty_settings = ProxySettings::new();
             self.set_proxy_settings(&empty_settings).await?;
         }
@@ -125,7 +125,7 @@ impl SystemProxyManager {
     async fn get_current_proxy_settings(&self) -> Result<ProxySettings> {
         let mut settings = ProxySettings::new();
 
-        // Получаем текущие настройки прокси из переменных окружения
+        // Get current proxy settings from environment variables
         if let Ok(http_proxy) = std::env::var("http_proxy") {
             settings.http_proxy = Some(http_proxy);
         }
@@ -143,7 +143,7 @@ impl SystemProxyManager {
     }
 
     async fn set_proxy_settings(&self, settings: &ProxySettings) -> Result<()> {
-        // Устанавливаем переменные окружения для текущего процесса
+        // Set environment variables for the current process
         if let Some(ref http_proxy) = settings.http_proxy {
             std::env::set_var("http_proxy", http_proxy);
             std::env::set_var("HTTP_PROXY", http_proxy);
@@ -199,7 +199,7 @@ impl SystemProxyManager {
             DesktopEnv::Gnome if which("gsettings") => set_proxy_gnome(settings)?,
             DesktopEnv::Kde if which("kwriteconfig5") => set_proxy_kde(settings)?,
             _ => {
-                // Пытаемся gsettings → KDE → иначе ничего (env уже выставлены)
+                // Try gsettings → KDE → otherwise do nothing (env already set)
                 if which("gsettings") {
                     set_proxy_gnome(settings)?;
                 } else if which("kwriteconfig5") {
@@ -543,10 +543,10 @@ function FindProxyForURL(url, host) {{
         log::info!("[SYSTEM_PROXY] Setting TUN mode: {}", enable);
         
         if enable {
-            // Включаем TUN режим - на macOS/Linux не используем системный прокси вовсе
+            // Enable TUN mode - on macOS/Linux we do not use system proxy at all
             self.enable_tun_mode().await?;
         } else {
-            // Отключаем TUN режим
+            // Disable TUN mode
             self.disable_tun_mode().await?;
         }
         
@@ -557,11 +557,11 @@ function FindProxyForURL(url, host) {{
 
     async fn enable_tun_mode(&mut self) -> Result<()> {
         log::info!("[SYSTEM_PROXY] Enabling TUN mode - clearing system proxies (macOS/Linux)");
-        // Сохраняем текущие настройки прокси
+        // Save current proxy settings
         if self.original_settings.is_none() {
             self.original_settings = Some(self.get_current_proxy_settings().await?);
         }
-        // В TUN режиме не выставляем прокси: очищаем их, чтобы трафик шел через TUN
+        // In TUN mode do not set proxy: clear it so that traffic goes through TUN
         let empty = ProxySettings::new();
         self.set_proxy_settings(&empty).await?;
         Ok(())
@@ -570,7 +570,7 @@ function FindProxyForURL(url, host) {{
     async fn disable_tun_mode(&mut self) -> Result<()> {
         log::info!("[SYSTEM_PROXY] Disabling TUN mode");
         
-        // Восстанавливаем оригинальные настройки прокси
+        // Restore original proxy settings
         if let Some(ref original) = self.original_settings {
             self.set_proxy_settings(original).await?;
         } else {

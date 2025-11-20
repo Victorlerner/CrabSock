@@ -44,7 +44,7 @@ impl ConfigManager {
         let config_dir = Self::get_config_dir()?;
         let config_path = config_dir.join("configs.json");
         
-        // Создаем директорию если не существует
+        // Create directory if it does not exist
         if !config_dir.exists() {
             fs::create_dir_all(&config_dir)?;
             log::info!("[CONFIG] Created config directory: {:?}", config_dir);
@@ -87,7 +87,7 @@ impl ConfigManager {
     pub async fn add_config(&self, proxy_config: ProxyConfig) -> Result<()> {
         let mut config_file = self.load_configs().await?;
         
-        // Проверяем, нет ли уже такого конфига
+        // Check that the config with the same name does not already exist
         let exists = config_file.configs.iter().any(|c| 
             c.server == proxy_config.server && 
             c.port == proxy_config.port && 
