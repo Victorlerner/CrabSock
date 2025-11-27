@@ -85,18 +85,31 @@ fn macos_tun_routes_ready() -> bool {
             let mut has_utun_default = false;
             let mut has_half_0 = false;
             let mut has_half_128 = false;
+            // macOS sometimes prints segmented coverage instead of 0/1; track common segments via utun*
+            let mut seg_hits = 0usize;
+            let seg_targets = ["1", "2/7", "4/6", "8/5", "16/4", "32/3", "64/2"];
             for line in text.lines() {
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() < 7 { continue; }
+                // Typical macOS columns: Destination Gateway Flags Netif Expire
+                if parts.len() < 4 { continue; }
                 let dest = parts[0];
-                let netif = parts[6];
+                // Netif is usually the penultimate column
+                let netif_idx = if parts.len() >= 4 { parts.len().saturating_sub(2) } else { continue };
+                let netif = parts[netif_idx];
                 if netif.starts_with("utun") {
                     if dest == "default" { has_utun_default = true; }
                     if dest == "0/1" || dest == "0.0.0.0/1" { has_half_0 = true; }
                     if dest == "128/1" || dest == "128.0.0.0/1" { has_half_128 = true; }
+                    if seg_targets.iter().any(|t| t == &dest) {
+                        seg_hits += 1;
+                    }
                 }
             }
-            return has_utun_default || (has_half_0 && has_half_128);
+            // Consider ready if:
+            // - default route via utun*, or
+            // - both half routes present, or
+            // - 128/1 present and we see several segmented routes via utun* (covers 0/1 split pattern)
+            return has_utun_default || (has_half_0 && has_half_128) || (has_half_128 && seg_hits >= 4);
         }
     }
     false
@@ -457,13 +470,9 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                                         }
                                         if !ready {
-                                            log::warn!("[ROUTING][macOS] TUN routes not detected in time. Falling back to SystemProxy.");
-                                            let _ = disable_tun_mode().await;
-                                            let proxy_settings = ProxySettings::with_socks5("127.0.0.1", 1080);
-                                            let mut system_manager = SYSTEM_PROXY_MANAGER.lock().await;
-                                            let _ = system_manager.set_system_proxy(&proxy_settings).await;
+                                            log::warn!("[ROUTING][macOS] TUN routes not detected in time. Keeping TUN active and skipping early fallback.");
                                             let _ = window_clone.emit("status", StatusEvent { status: "connected".into() });
-                                            return;
+                                            // Continue without forcing fallback; IP change check below may still succeed
                                         }
                                         // После готовности маршрутов проверяем смену IP (даём до ~10s)
                                         for _ in 0..20 {
@@ -601,13 +610,9 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                                         }
                                         if !ready {
-                                            log::warn!("[ROUTING][macOS] TUN routes not detected in time. Falling back to SystemProxy.");
-                                            let _ = disable_tun_mode().await;
-                                            let proxy_settings = ProxySettings::with_socks5("127.0.0.1", 1080);
-                                            let mut system_manager = SYSTEM_PROXY_MANAGER.lock().await;
-                                            let _ = system_manager.set_system_proxy(&proxy_settings).await;
+                                            log::warn!("[ROUTING][macOS] TUN routes not detected in time. Keeping TUN active and skipping early fallback.");
                                             let _ = window_clone.emit("status", StatusEvent { status: "connected".into() });
-                                            return;
+                                            // Continue without forcing fallback; IP change check below may still succeed
                                         }
                                         // После готовности маршрутов проверяем смену IP (даём до ~10s)
                                         for _ in 0..20 {
