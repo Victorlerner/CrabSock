@@ -136,6 +136,23 @@ impl ProxyClient for VlessClient {
         }
         self.status = ConnectionStatus::Connecting;
 
+        // Best-effort: ensure no stale sing-box instances remain from previous runs (Windows only)
+        // This prevents port 1080 conflicts and ghost processes after abrupt exits.
+        #[cfg(target_os = "windows")]
+        {
+            use tokio::process::Command as TokioCommand;
+            let _ = TokioCommand::new("taskkill")
+                .creation_flags(0x08000000)
+                .args(["/IM", "sing-box.exe", "/F", "/T"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await;
+            // small delay to let the OS release the socket
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+
         #[cfg(target_os = "windows")]
         {
             use tokio::net::TcpStream;
@@ -243,30 +260,96 @@ impl ProxyClient for VlessClient {
         self.supervisor_stop.store(true, Ordering::SeqCst);
         if let Some(h) = self.supervisor_task.take() { let _ = h.abort(); }
 
+        // Windows: first try to kill any sing-box by image name unconditionally.
+        // This covers races where the supervisor temporarily holds the child handle.
+        #[cfg(target_os = "windows")]
+        {
+            use tokio::process::Command as TokioCommand;
+            let _ = TokioCommand::new("taskkill")
+                .creation_flags(0x08000000)
+                .args(["/IM", "sing-box.exe", "/F", "/T"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await;
+        }
+
         // Kill supervised child
         {
             let mut guard = self.supervised_child.lock().await;
             if let Some(mut child) = guard.take() {
+                // On Windows: try killing by PID tree up-front to ensure descendants are gone
+                #[cfg(target_os = "windows")]
+                if let Some(pid) = child.id() {
+                    use tokio::process::Command as TokioCommand;
+                    let _ = TokioCommand::new("taskkill")
+                        .creation_flags(0x08000000)
+                        .args(["/PID", &pid.to_string(), "/T", "/F"])
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .await;
+                }
+
+                // Generic kill and wait as a fallback
                 let _ = child.kill().await;
                 let _ = tokio::time::timeout(std::time::Duration::from_millis(1500), child.wait()).await;
-                #[cfg(target_os = "windows")]
-                {
-                    if let Some(pid) = child.id() {
-                        use tokio::process::Command as TokioCommand;
-                        let mut k = TokioCommand::new("taskkill");
-                        #[cfg(target_os = "windows")]
-                        { k.creation_flags(0x08000000); }
-                        let _ = k
-                            .args(["/PID", &pid.to_string(), "/T", "/F"]) 
-                            .stdin(std::process::Stdio::null())
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null())
-                            .status()
-                            .await;
-                    }
-                }
             }
         }
+
+        // Windows: Verify process truly gone; loop on tasklist for a short time
+        #[cfg(target_os = "windows")]
+        {
+            use tokio::process::Command as TokioCommand;
+            let mut tries = 0usize;
+            while tries < 15 {
+                let out = TokioCommand::new("tasklist")
+                    .creation_flags(0x08000000)
+                    .args(["/FI", "IMAGENAME eq sing-box.exe"])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                    .await;
+                let mut still_present = false;
+                if let Ok(o) = out {
+                    if o.status.success() {
+                        let s = String::from_utf8_lossy(&o.stdout).to_ascii_lowercase();
+                        if s.contains("sing-box.exe".to_ascii_lowercase().as_str()) { still_present = true; }
+                    }
+                }
+                if !still_present { break; }
+                // try again after forcing a kill by name
+                let _ = TokioCommand::new("taskkill")
+                    .creation_flags(0x08000000)
+                    .args(["/IM", "sing-box.exe", "/F", "/T"])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                tries += 1;
+            }
+        }
+
+        // Wait until 127.0.0.1:1080 is free (avoid race before next connection)
+        // Non-fatal if we can't confirm, but reduces chances of port-in-use issues.
+        {
+            use std::net::{TcpListener};
+            let mut attempts = 0usize;
+            while attempts < 10 {
+                if TcpListener::bind("127.0.0.1:1080").is_ok() {
+                    // immediately drop the listener to free the port
+                    break;
+                }
+                attempts += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+
         self.status = ConnectionStatus::Disconnected;
         Ok(())
     }

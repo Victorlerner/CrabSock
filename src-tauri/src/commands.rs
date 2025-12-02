@@ -264,6 +264,8 @@ pub async fn ensure_admin_for_tun() -> Result<bool, String> {
 #[tauri::command]
 pub async fn exit_app(app: tauri::AppHandle) -> Result<(), String> {
     // Ensure OpenVPN and sing-box are stopped before exiting
+    // Stop proxy pipelines (sing-box/shadowsocks) silently
+    disconnect_vpn_silent().await;
     crate::openvpn::OpenVpnManager::disconnect_silent();
     let _ = app.exit(0);
     Ok(())
@@ -412,6 +414,7 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                         ip_info.ip, ip_info.country);
                     
                     // Сохраняем базовый IP для последующей проверки смены при TUN
+                    #[allow(unused_variables)]
                     let baseline_ip = ip_info.ip.clone();
                     let ip_result = window.emit("ip_verified", ip_info);
                     
@@ -566,6 +569,7 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                                     manager.mark_connected().await;
                                 }
                                 // Capture baseline IP before routing changes
+                                #[allow(unused_variables)]
                                 let baseline_ip = ip_info.ip.clone();
                                 let _ = window.emit("ip_verified", ip_info);
                                 let settings = ConfigManager::new().map_err(|e| e.to_string())?.load_configs().await.map_err(|e| e.to_string())?.settings;
