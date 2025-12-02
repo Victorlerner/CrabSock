@@ -11,6 +11,28 @@ use tauri::Emitter;
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
 use tauri::menu::{Menu, MenuItem};
 
+fn activate_main_window(app: &tauri::AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        #[cfg(target_os = "macos")]
+        {
+            let _ = win.set_focus();
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = win.set_always_on_top(true);
+            let _ = win.set_focus();
+            let _ = win.set_always_on_top(false);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // On some WMs focus-stealing prevention may block focus; ask for attention as a hint
+            let _ = win.request_user_attention(Some(tauri::UserAttentionType::Informational));
+        }
+    }
+}
+
 fn main() {
     // On Windows release builds: if launched from an existing console (cmd/powershell),
     // attach to it so stdout/stderr prints are visible. If started from Explorer, do nothing.
@@ -130,6 +152,10 @@ fn main() {
     }
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            // Focus already running instance instead of spawning a new one
+            activate_main_window(&app.app_handle());
+        }))
         .setup(move |app| {
             // Создаем трей-иконку и обрабатываем клики для показа окна
             let icon = app.default_window_icon().cloned().expect("default window icon missing");
@@ -149,10 +175,7 @@ fn main() {
                     match event {
                         // ЛКМ открывает меню; даблклик показывает окно
                         TrayIconEvent::DoubleClick { .. } => {
-                            if let Some(win) = icon.app_handle().get_webview_window("main") {
-                                let _ = win.show();
-                                let _ = win.set_focus();
-                            }
+                            activate_main_window(&icon.app_handle());
                         }
                         TrayIconEvent::Click { .. } => { /* меню покажет сам таури */ }
                         _ => {}
@@ -161,10 +184,7 @@ fn main() {
                 .on_menu_event(|icon, event| {
                     match event.id.as_ref() {
                         "show" => {
-                            if let Some(win) = icon.app_handle().get_webview_window("main") {
-                                let _ = win.show();
-                                let _ = win.set_focus();
-                            }
+                            activate_main_window(&icon.app_handle());
                         }
                         "quit" => {
                             // Грейсфул-шатдаун: сначала останавливаем прокси (убьёт sing-box), затем TUN и системный прокси
