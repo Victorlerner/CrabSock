@@ -266,6 +266,11 @@ pub async fn exit_app(app: tauri::AppHandle) -> Result<(), String> {
     // Ensure OpenVPN and sing-box are stopped before exiting
     // Stop proxy pipelines (sing-box/shadowsocks) silently
     disconnect_vpn_silent().await;
+    // Clear system proxy explicitly to avoid leaving broken settings
+    {
+        let mut system_manager = SYSTEM_PROXY_MANAGER.lock().await;
+        let _ = system_manager.clear_system_proxy().await;
+    }
     crate::openvpn::OpenVpnManager::disconnect_silent();
     let _ = app.exit(0);
     Ok(())
@@ -698,6 +703,12 @@ pub async fn disconnect_vpn(window: tauri::Window) -> Result<(), String> {
 
     match result {
         Ok(_) => {
+            // Явно очищаем системный прокси на всех платформах (особенно Windows), чтобы не оставить "битый" прокси
+            {
+                let mut system_manager = SYSTEM_PROXY_MANAGER.lock().await;
+                let _ = system_manager.clear_system_proxy().await;
+            }
+
             let _ = window.emit("status", StatusEvent {
                 status: "disconnected".into(),
             });

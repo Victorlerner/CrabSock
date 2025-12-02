@@ -218,7 +218,7 @@ impl SystemProxyManager {
         // and install a PAC file to DIRECT-bypass private ranges and VPN (Pritunl/WireGuard/TAP) routes.
         // Keys under: HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings
         //  - ProxyEnable (DWORD)
-        //  - ProxyServer (STRING) e.g. "http=127.0.0.1:8080;https=127.0.0.1:8080"
+        //  - ProxyServer (STRING) e.g. "http=127.0.0.1:<port>;https=127.0.0.1:<port>"
         //  - ProxyOverride (STRING) semicolon-separated patterns
         //  - AutoConfigURL (STRING) to point at PAC file
 
@@ -228,7 +228,8 @@ impl SystemProxyManager {
 
         if settings.http_proxy.is_some() || settings.socks_proxy.is_some() {
             // Always drive via local ACL HTTP proxy on Windows
-            let proxy_str = "http=127.0.0.1:8080;https=127.0.0.1:8080";
+            let http_port: u16 = std::env::var("ACL_HTTP_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8080);
+            let proxy_str = format!("http=127.0.0.1:{p};https=127.0.0.1:{p}", p = http_port);
             key.set_value("ProxyEnable", &1u32)?;
             key.set_value("ProxyServer", &proxy_str)?;
 
@@ -258,7 +259,7 @@ impl SystemProxyManager {
             key.set_value("ProxyOverride", &override_val)?;
 
             // Install PAC to dynamically DIRECT-bypass VPN routes
-            if let Some(pac_path) = Self::write_windows_pac("127.0.0.1", 8080) {
+            if let Some(pac_path) = Self::write_windows_pac("127.0.0.1", http_port) {
                 key.set_value("AutoConfigURL", &format!("file://{}", pac_path))?;
             }
         } else {
