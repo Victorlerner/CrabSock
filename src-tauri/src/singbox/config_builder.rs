@@ -8,7 +8,11 @@ use crate::outbound::factory::make_from_env;
 pub fn build_singbox_config(cfg: &TunConfig, socks_host: String, socks_port: u16) -> Result<PathBuf> {
     use std::net::{IpAddr, ToSocketAddrs};
 
-    let sb_log_level = std::env::var("SB_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+    // For Linux we default sing-box log level to "warn",
+    // on other platforms we keep "info". Can be overridden via SB_LOG_LEVEL.
+    let default_log_level = if cfg!(target_os = "linux") { "warn" } else { "info" };
+    let sb_log_level =
+        std::env::var("SB_LOG_LEVEL").unwrap_or_else(|_| default_log_level.to_string());
     log::info!("[SING-BOX][CONFIG] Building sing-box config (log.level={sb_log_level}, socks={socks_host}:{socks_port})");
 
     let mut direct_cidrs: Vec<String> = vec![
@@ -36,28 +40,50 @@ pub fn build_singbox_config(cfg: &TunConfig, socks_host: String, socks_port: u16
         }
     }
 
-    let inet4 = format!("{}/{}", cfg.address, {
-        let mask = u32::from(cfg.netmask);
-        mask.count_ones() as u8
-    });
+    let inet4 = format!(
+        "{}/{}",
+        cfg.address,
+        {
+            let mask = u32::from(cfg.netmask);
+            mask.count_ones() as u8
+        }
+    );
 
     let outbounds = make_from_env(socks_host, socks_port).build_outbounds();
 
-    let mut dns_rules: Vec<serde_json::Value> = Vec::new();
-    if let Ok(host) = std::env::var("SB_VLESS_SERVER") {
-        if host.chars().any(|c| c.is_alphabetic()) {
-            dns_rules.push(json!({ "domain": [host], "server": "dns-direct" }));
-        }
-    }
-    dns_rules.push(json!({ "query_type": [32, 33], "server": "dns-block" }));
-    dns_rules.push(json!({ "domain_suffix": [".lan"], "server": "dns-block" }));
+    // In sing-box 1.11+ we no longer need special outbounds (dns, block),
+    // rule actions are used instead.
 
-    // Build TUN inbound; on macOS we will prefer system stack and relaxed routing to improve compatibility
+    // DNS configuration for sing-box 1.12+:
+    // use public DNS (8.8.8.8) over UDP – simpler than DoH and without loops.
+    let mut dns_rules: Vec<serde_json::Value> = Vec::new();
+    
+    // Block unwanted DNS queries
+    dns_rules.push(json!({ 
+        "query_type": [32, 33], 
+        "server": "dns-block",
+        "disable_cache": true
+    }));
+    dns_rules.push(json!({ 
+        "domain_suffix": [".lan"], 
+        "server": "dns-block",
+        "disable_cache": true
+    }));
+
+    // Build TUN inbound.
+    //
+    // General scheme:
+    // - Windows / macOS: use a more conservative schema with `address` field
+    // - Linux: move to modern sing-box schema with `inet4_address`,
+    //   to be closer to nekoray and current documentation.
+    // TUN inbound is the KEY decision to avoid multiple sudo prompts:
+    // use auto_route: true BUT with gvisor stack.
+    // gvisor performs routing in userspace, sing-box only creates the interface (one sudo prompt).
     let mut tun_inbound = json!({
         "type": "tun",
         "tag": "tun-in",
         "address": [ inet4 ],
-        "mtu": 1400,
+        "mtu": cfg.mtu,
         "auto_route": true,
         "strict_route": true,
         "endpoint_independent_nat": true,
@@ -95,6 +121,7 @@ pub fn build_singbox_config(cfg: &TunConfig, socks_host: String, socks_port: u16
             }
         }
     }
+
     let mut inbounds: Vec<serde_json::Value> = vec![tun_inbound];
     if std::env::var("SINGBOX_ENABLE_MIXED").ok().as_deref() == Some("1") {
         let mixed_port: u16 = std::env::var("SINGBOX_MIXED_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(1081);
@@ -113,22 +140,29 @@ pub fn build_singbox_config(cfg: &TunConfig, socks_host: String, socks_port: u16
         "log": { "level": sb_log_level, "timestamp": true },
         "inbounds": inbounds,
         "dns": {
-            "independent_cache": true,
-            "rules": dns_rules,
             "servers": [
-                { "address": "https://doh.pub/dns-query",    "address_resolver": "dns-local", "detour": "direct", "tag": "dns-direct" },
-                { "address": "rcode://success",               "tag": "dns-block" },
-                { "address": "local",                         "detour": "direct", "tag": "dns-local" }
-            ]
+                {
+                    "tag": "dns-remote",
+                    "address": "8.8.8.8"
+                },
+                {
+                    "tag": "dns-block",
+                    "address": "rcode://success"
+                }
+            ],
+            "rules": dns_rules,
+            "final": "dns-remote"
         },
         "outbounds": outbounds,
         "route": {
             "auto_detect_interface": true,
-            "default_domain_resolver": "dns-direct",
             "final": "proxy",
             "rules": [
+                // DNS hijack - intercept all DNS traffic through TUN
                 { "protocol": "dns", "action": "hijack-dns" },
-                { "ip_cidr": direct_cidrs, "action": "direct" },
+                // Local networks go directly
+                { "ip_cidr": direct_cidrs, "outbound": "direct" },
+                // Block noisy/garbage ports
                 { "network": "udp", "port": [135,137,138,139,5353], "action": "reject" },
                 { "ip_cidr": ["224.0.0.0/3","ff00::/8"], "action": "reject" },
                 { "source_ip_cidr": ["224.0.0.0/3","ff00::/8"], "action": "reject" }

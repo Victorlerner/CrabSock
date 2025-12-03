@@ -4,10 +4,19 @@ version = "0.1.0"
 edition = "2021"
 exclude = ["pkg/*", "pkg/**"]
 license = "Apache-2.0"
+default-run = "crab-sock"
 
 [lib]
 name = "crab_sock"
 path = "src/lib.rs"
+
+[[bin]]
+name = "crab-sock"
+path = "src/main.rs"
+
+[[bin]]
+name = "crabsock-root-helper"
+path = "src/root_helper_main.rs"
 
 [dependencies]
 tauri = { version = "2.0.0", features = ["tray-icon"] }
@@ -42,6 +51,7 @@ tun-tap = "0.1"
 tokio-tun = "0.15"
 rtnetlink = "0.14"
 ipnetwork = "0.20"
+libc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winreg = "0.52"

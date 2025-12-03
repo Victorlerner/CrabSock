@@ -35,6 +35,8 @@ pub struct OpenVpnManager {
     management_password_path: Option<PathBuf>,
     connected: bool,
     temp_cfg_path: Option<PathBuf>,
+    #[cfg(target_os = "linux")]
+    used_helper: bool,
     #[cfg(target_os = "macos")]
     pid_file_path: Option<PathBuf>,
     #[cfg(target_os = "macos")]
@@ -405,6 +407,170 @@ impl OpenVpnManager {
         // Use stdout for logs; avoid redirecting to file so frontend receives live logs
         let args_with_log = args.clone();
 
+        // On Linux we try to use the setuid helper crabsock-root-helper,
+        // which executes the system openvpn with the same arguments.
+        // If the helper is not installed, we try to install it via pkexec and the bundled installer script.
+        #[cfg(target_os = "linux")]
+        let (spawn_exe, used_helper_flag) = {
+            const ROOT_HELPER_VERSION: &str = "1";
+
+            fn find_existing_helper() -> Option<PathBuf> {
+                use std::path::Path;
+                #[cfg(unix)]
+                fn is_suid_root(p: &Path) -> bool {
+                    use std::os::unix::fs::PermissionsExt;
+                    use std::os::unix::prelude::MetadataExt;
+                    if let Ok(meta) = std::fs::metadata(p) {
+                        let mode = meta.permissions().mode();
+                        let uid = meta.uid();
+                        // setuid bit and owned by root
+                        (mode & 0o4000) != 0 && uid == 0
+                    } else {
+                        false
+                    }
+                }
+                #[cfg(not(unix))]
+                fn is_suid_root(_p: &Path) -> bool { false }
+
+                let mut candidates: Vec<PathBuf> = Vec::new();
+                // 1) next to the application binary (primary path in dev/packaged mode)
+                if let Ok(cur) = std::env::current_exe() {
+                    if let Some(dir) = cur.parent() {
+                        candidates.push(dir.join("crabsock-root-helper"));
+                    }
+                }
+                // 2) system fallback, if installer already placed helper into /usr/local/bin
+                candidates.push(PathBuf::from("/usr/local/bin/crabsock-root-helper"));
+
+                for p in candidates {
+                    if !(p.exists() && p.is_file() && is_suid_root(&p)) {
+                        continue;
+                    }
+                    // Check helper version; if it does not match, treat as not installed.
+                    let out = std::process::Command::new(&p)
+                        .arg("version")
+                        .stdin(Stdio::null())
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::null())
+                        .output();
+                    if let Ok(o) = out {
+                        let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                        if v == ROOT_HELPER_VERSION {
+                            return Some(p);
+                        }
+                    }
+                }
+                None
+            }
+
+            if let Some(helper) = find_existing_helper() {
+                let msg = format!(
+                    "[OPENVPN] Using helper binary: {} (will execute system openvpn)",
+                    helper.display()
+                );
+                let _ = app.emit("openvpn-log", msg.clone());
+                for (_, win) in app.webview_windows() {
+                    let _ = win.emit("openvpn-log", msg.clone());
+                }
+                (helper, true)
+            } else {
+                // Try to auto-install the helper via pkexec.
+                let install_result: Result<(), String> = (|| {
+                    let cur = std::env::current_exe().map_err(|e| e.to_string())?;
+                    let exe_dir = cur.parent().ok_or_else(|| "Failed to resolve exe dir".to_string())?;
+                    let helper_src = exe_dir.join("crabsock-root-helper");
+                    if !helper_src.exists() {
+                        return Err(format!(
+                            "Helper binary not found next to executable: {}",
+                            helper_src.display()
+                        ));
+                    }
+
+                    // Locate install-openvpn-helper.sh in resources
+                    let mut script_candidates: Vec<PathBuf> = Vec::new();
+                    script_candidates.push(exe_dir.join("resources").join("install-openvpn-helper.sh"));
+                    if let Some(parent) = exe_dir.parent() {
+                        if let Some(grandparent) = parent.parent() {
+                            script_candidates.push(grandparent.join("resources").join("install-openvpn-helper.sh"));
+                            script_candidates.push(
+                                grandparent
+                                    .join("src-tauri")
+                                    .join("resources")
+                                    .join("install-openvpn-helper.sh"),
+                            );
+                        }
+                    }
+                    let script = script_candidates
+                        .into_iter()
+                        .find(|p| p.exists() && p.is_file())
+                        .ok_or_else(|| "install-openvpn-helper.sh not found in resources".to_string())?;
+
+                    let msg = format!(
+                        "[OPENVPN] Installing helper via pkexec: script={} src={}",
+                        script.display(),
+                        helper_src.display()
+                    );
+                    let _ = app.emit("openvpn-log", msg.clone());
+                    for (_, win) in app.webview_windows() {
+                        let _ = win.emit("openvpn-log", msg.clone());
+                    }
+
+                    let status = std::process::Command::new("pkexec")
+                        .arg("bash")
+                        .arg(&script)
+                        .arg(&helper_src)
+                        .stdin(Stdio::null())
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .status()
+                        .map_err(|e| format!("Failed to execute pkexec: {}", e))?;
+
+                    if !status.success() {
+                        return Err(format!("pkexec install-openvpn-helper.sh exited with status {:?}", status.code()));
+                    }
+
+                    Ok(())
+                })();
+
+                match install_result {
+                    Ok(()) => {
+                        if let Some(helper) = find_existing_helper() {
+                            let msg = format!(
+                                "[OPENVPN] Helper installed and will be used: {}",
+                                helper.display()
+                            );
+                            let _ = app.emit("openvpn-log", msg.clone());
+                            for (_, win) in app.webview_windows() {
+                                let _ = win.emit("openvpn-log", msg.clone());
+                            }
+                            (helper, true)
+                        } else {
+                            let msg = "[OPENVPN] Helper installation reported success but helper not found; falling back to direct openvpn";
+                            let _ = app.emit("openvpn-log", msg);
+                            for (_, win) in app.webview_windows() {
+                                let _ = win.emit("openvpn-log", msg);
+                            }
+                            (exe.clone(), false)
+                        }
+                    }
+                    Err(e) => {
+                        let msg = format!(
+                            "[OPENVPN] Failed to auto-install helper (pkexec): {}; falling back to direct openvpn",
+                            e
+                        );
+                        let _ = app.emit("openvpn-log", msg.clone());
+                        for (_, win) in app.webview_windows() {
+                            let _ = win.emit("openvpn-log", msg.clone());
+                        }
+                        (exe.clone(), false)
+                    }
+                }
+            }
+        };
+
+        #[cfg(not(target_os = "linux"))]
+        let (spawn_exe, used_helper_flag) = (exe.clone(), false);
+
         // Spawn process (Windows: require app to be elevated; do not self-elevate OpenVPN)
         #[cfg(target_os = "windows")]
         let mut child: Option<Child> = {
@@ -434,15 +600,15 @@ impl OpenVpnManager {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                if let Ok(meta) = std::fs::metadata(&exe) {
+                if let Ok(meta) = std::fs::metadata(&spawn_exe) {
                     let mut perm = meta.permissions();
                     let mode = perm.mode();
                     // ensure owner/group/world execute bits
                     let target = mode | 0o111;
                     if target != mode {
                         perm.set_mode(target);
-                        let _ = std::fs::set_permissions(&exe, perm);
-                        let msg = format!("[OPENVPN] Set executable bit on {}", exe.display());
+                        let _ = std::fs::set_permissions(&spawn_exe, perm);
+                        let msg = format!("[OPENVPN] Set executable bit on {}", spawn_exe.display());
                         let _ = app.emit("openvpn-log", msg.clone());
                         for (_, win) in app.webview_windows() { let _ = win.emit("openvpn-log", msg.clone()); }
                     }
@@ -571,7 +737,7 @@ impl OpenVpnManager {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let mut cmd = Command::new(&exe);
+            let mut cmd = Command::new(&spawn_exe);
             cmd.args(&args_with_log)
                 .stdin(Stdio::null())
                 .stdout(std::process::Stdio::piped())
@@ -584,16 +750,16 @@ impl OpenVpnManager {
                         #[cfg(unix)]
                         {
                             use std::os::unix::fs::PermissionsExt;
-                            if let Ok(meta) = std::fs::metadata(&exe) {
+                            if let Ok(meta) = std::fs::metadata(&spawn_exe) {
                                 let mut perm = meta.permissions();
                                 perm.set_mode(0o755);
-                                let _ = std::fs::set_permissions(&exe, perm);
-                                let msg = format!("[OPENVPN] Permission denied; applied chmod 755 to {}", exe.display());
+                                let _ = std::fs::set_permissions(&spawn_exe, perm);
+                                let msg = format!("[OPENVPN] Permission denied; applied chmod 755 to {}", spawn_exe.display());
                                 let _ = app.emit("openvpn-log", msg.clone());
                                 for (_, win) in app.webview_windows() { let _ = win.emit("openvpn-log", msg.clone()); }
                             }
                         }
-                        let retry = Command::new(&exe)
+                        let retry = Command::new(&spawn_exe)
                             .args(&args_with_log)
                             .stdin(Stdio::null())
                             .stdout(std::process::Stdio::piped())
@@ -647,6 +813,10 @@ impl OpenVpnManager {
             g.management_password_path = if supports_management { Some(management_password_path.clone()) } else { None };
             g.connected = false;
             g.temp_cfg_path = Some(tmp_cfg.clone());
+            #[cfg(target_os = "linux")]
+            {
+                g.used_helper = used_helper_flag;
+            }
         }
 
         // Emit initial status, then watch for connected line in logs
@@ -712,7 +882,18 @@ impl OpenVpnManager {
                 let _ = send_management_signal(port, pass_path, "signal SIGTERM");
                 thread::sleep(Duration::from_millis(300));
             }
-            let _ = child.kill();
+            #[cfg(target_os = "linux")]
+            {
+                // If we used the setuid helper, rely on management SIGTERM only,
+                // to avoid leaving the root-owned openvpn process orphaned after killing the helper process.
+                if !self.used_helper {
+                    let _ = child.kill();
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = child.kill();
+            }
         }
         #[cfg(target_os = "macos")]
         {
@@ -782,6 +963,10 @@ impl OpenVpnManager {
         self.management_password_path = None;
         self.connected = false;
         self.temp_cfg_path = None;
+        #[cfg(target_os = "linux")]
+        {
+            self.used_helper = false;
+        }
         #[cfg(target_os = "macos")]
         {
             self.pid_file_path = None;

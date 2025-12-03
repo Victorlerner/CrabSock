@@ -19,7 +19,7 @@ const options = computed(() => {
     return [ { label: 'System Proxy', value: 'systemproxy' as const }, { label: 'TUN (Kernel)', value: 'tun' as const } ]
   }
   if (osPlatform.value === 'linux') {
-    return [ { label: 'TUN (Kernel)', value: 'tun' as const } ]
+    return [ { label: 'System Proxy', value: 'systemproxy' as const }, { label: 'TUN (Kernel)', value: 'tun' as const } ]
   }
   if (osPlatform.value === 'windows') {
     return [ { label: 'System Proxy', value: 'systemproxy' as const }, { label: 'TUN (Kernel)', value: 'tun' as const } ]
@@ -36,14 +36,16 @@ async function init() {
 }
 
 async function onChange() {
-  if (osPlatform.value === 'windows' && selected.value === 'tun') {
+  if ((osPlatform.value === 'windows' || osPlatform.value === 'linux') && selected.value === 'tun') {
     try {
       // Persist desired mode first so relaunched admin instance reads it
       await store.setRoutingMode('tun')
 
       const ok = await (await import('@tauri-apps/api/core')).invoke<boolean>('ensure_admin_for_tun')
       if (!ok) {
-        store.addLog('info', 'Elevation requested. Confirm UAC dialog; app will relaunch as admin.', 'frontend')
+        store.addLog('info', osPlatform.value === 'windows'
+          ? 'Elevation requested. Confirm UAC dialog; app will relaunch as admin.'
+          : 'Attempting to set capabilities via pkexec/sudo; app will relaunch.', 'frontend')
         // Terminate current process to avoid double instances; elevated one will start
         await (await import('@tauri-apps/api/core')).invoke('exit_app')
         return
@@ -52,7 +54,7 @@ async function onChange() {
       // Roll back to System Proxy if elevation failed/cancelled
       await store.setRoutingMode('systemproxy')
       selected.value = 'systemproxy'
-      store.addLog('error', `Failed to request admin rights: ${e}`, 'frontend')
+      store.addLog('error', `Failed to enable TUN permissions: ${e}`, 'frontend')
       return
     }
     return
@@ -70,7 +72,7 @@ onMounted(init)
         <div class="text-sm font-medium">Routing mode</div>
         <div class="text-xs text-gray-500 dark:text-gray-400">
           <span v-if="osPlatform==='macos'">macOS: System Proxy or TUN</span>
-          <span v-else-if="osPlatform==='linux'">Linux: TUN only</span>
+          <span v-else-if="osPlatform==='linux'">Linux: System Proxy or TUN</span>
           <span v-else>Windows: System Proxy by default</span>
         </div>
       </div>

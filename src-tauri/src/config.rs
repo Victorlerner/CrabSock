@@ -261,7 +261,7 @@ impl ProxyConfig {
             name,
             server,
             port,
-            // Для унификации: используем UUID как пароль-плейсхолдер (многие конвейеры ожидают non-null)
+            // For consistency: use UUID as password placeholder (many pipelines expect non-null)
             password: Some(uuid.clone()),
             method: None,
             uuid: Some(uuid),

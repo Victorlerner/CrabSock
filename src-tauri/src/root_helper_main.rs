@@ -1,0 +1,229 @@
+//! crabsock-root-helper
+//!
+//! Small setuid-root helper that performs privileged VPN operations:
+//! - runs system `openvpn` with given arguments;
+//! - runs embedded/system `sing-box` with given config;
+//! - stops sing-box processes.
+//!
+//! Modes:
+//! - default / `openvpn`: arguments are passed directly to `openvpn`, require `--config <abs_path>`;
+//! - `singbox-run <bin_path> <config_path>`: runs `sing-box run -c <config_path> --disable-color`;
+//! - `singbox-kill`: sends SIGTERM (and optionally SIGKILL) to all sing-box processes.
+//!
+//! Helper is expected to be installed as setuid-root and owned by root.
+
+use std::env;
+use std::path::Path;
+use std::process::{Command, ExitCode};
+
+const HELPER_VERSION: &str = "1";
+
+#[cfg(target_os = "linux")]
+fn main() -> ExitCode {
+    let mut args: Vec<String> = env::args().skip(1).collect();
+
+    if args.is_empty() {
+        eprintln!("crabsock-root-helper: expected mode and arguments, e.g.:");
+        eprintln!("  crabsock-root-helper --config /abs/path/to.ovpn --verb 2");
+        eprintln!("  crabsock-root-helper singbox-run /path/to/sing-box /abs/config.json");
+        eprintln!("  crabsock-root-helper singbox-kill");
+        return ExitCode::from(1);
+    }
+
+    #[cfg(unix)]
+    {
+        use libc::geteuid;
+        unsafe {
+            if geteuid() != 0 {
+                eprintln!(
+                    "crabsock-root-helper: warning: running without root privileges (geteuid != 0)"
+                );
+            }
+        }
+    }
+
+    let mode = args.get(0).map(|s| s.as_str()).unwrap_or_default();
+
+    match mode {
+        "version" | "--version" | "-V" => {
+            // Print helper version to stdout and exit.
+            println!("{HELPER_VERSION}");
+            ExitCode::SUCCESS
+        }
+        "singbox-run" => {
+            // crabsock-root-helper singbox-run <bin_path> <config_path>
+            if args.len() < 3 {
+                eprintln!(
+                    "crabsock-root-helper: singbox-run requires <bin_path> <config_path>"
+                );
+                return ExitCode::from(1);
+            }
+            let bin_path = args[1].clone();
+            let cfg_path = args[2].clone();
+            let bin = Path::new(&bin_path);
+            let cfg = Path::new(&cfg_path);
+            if !bin.is_absolute() || !cfg.is_absolute() {
+                eprintln!(
+                    "crabsock-root-helper: singbox-run requires absolute paths, got: bin={} cfg={}",
+                    bin_path, cfg_path
+                );
+                return ExitCode::from(1);
+            }
+            if bin_path.contains("..") || cfg_path.contains("..") {
+                eprintln!(
+                    "crabsock-root-helper: paths must not contain '..': bin={}, cfg={}",
+                    bin_path, cfg_path
+                );
+                return ExitCode::from(1);
+            }
+            if !bin.exists() {
+                eprintln!(
+                    "crabsock-root-helper: sing-box binary does not exist: {}",
+                    bin_path
+                );
+                return ExitCode::from(1);
+            }
+            if !cfg.exists() {
+                eprintln!(
+                    "crabsock-root-helper: config file does not exist: {}",
+                    cfg_path
+                );
+                return ExitCode::from(1);
+            }
+
+            let status = match Command::new(&bin_path)
+                .args(["run", "-c", &cfg_path, "--disable-color"])
+                .spawn()
+                .and_then(|mut child| child.wait())
+            {
+                Ok(status) => status,
+                Err(e) => {
+                    eprintln!("crabsock-root-helper: failed to start sing-box: {}", e);
+                    return ExitCode::from(1);
+                }
+            };
+
+            if let Some(code) = status.code() {
+                ExitCode::from(code as u8)
+            } else if status.success() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
+        }
+        "singbox-kill" => {
+            // crabsock-root-helper singbox-kill
+            // Try graceful SIGTERM first, then SIGKILL as fallback.
+            let term_status = Command::new("killall")
+                .args(["-TERM", "sing-box"])
+                .spawn()
+                .and_then(|mut c| c.wait());
+            if let Err(e) = term_status {
+                eprintln!(
+                    "crabsock-root-helper: failed to send SIGTERM to sing-box via killall: {}",
+                    e
+                );
+            }
+
+            // Best-effort: short sleep then SIGKILL
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let _ = Command::new("killall")
+                .args(["-KILL", "sing-box"])
+                .spawn()
+                .and_then(|mut c| c.wait());
+
+            ExitCode::SUCCESS
+        }
+        // Default / legacy mode: treat arguments as direct openvpn args
+        _ => {
+            // If mode is something like "openvpn", skip it and treat the rest as args
+            let openvpn_args: Vec<String> = if mode == "openvpn" {
+                args.drain(0..1);
+                args
+            } else {
+                args
+            };
+
+            if openvpn_args.is_empty() {
+                eprintln!("crabsock-root-helper: expected openvpn arguments, e.g.:");
+                eprintln!("  crabsock-root-helper --config /abs/path/to.ovpn --verb 2");
+                return ExitCode::from(1);
+            }
+
+            // Find --config and validate its value
+            let mut config_path: Option<String> = None;
+            let mut i = 0;
+            while i < openvpn_args.len() {
+                if openvpn_args[i] == "--config" {
+                    if i + 1 >= openvpn_args.len() {
+                        eprintln!(
+                            "crabsock-root-helper: --config flag requires a value"
+                        );
+                        return ExitCode::from(1);
+                    }
+                    let p = openvpn_args[i + 1].clone();
+                    config_path = Some(p);
+                    break;
+                }
+                i += 1;
+            }
+
+            let config_path = match config_path {
+                Some(p) => p,
+                None => {
+                    eprintln!("crabsock-root-helper: --config <path> is required");
+                    return ExitCode::from(1);
+                }
+            };
+
+            let cfg = Path::new(&config_path);
+            if !cfg.is_absolute() {
+                eprintln!(
+                    "crabsock-root-helper: config path must be absolute, got: {}",
+                    config_path
+                );
+                return ExitCode::from(1);
+            }
+            if config_path.contains("..") {
+                eprintln!(
+                    "crabsock-root-helper: config path must not contain '..': {}",
+                    config_path
+                );
+                return ExitCode::from(1);
+            }
+
+            let status = match Command::new("openvpn")
+                .args(&openvpn_args)
+                .spawn()
+                .and_then(|mut child| child.wait())
+            {
+                Ok(status) => status,
+                Err(e) => {
+                    eprintln!("crabsock-root-helper: failed to start openvpn: {}", e);
+                    return ExitCode::from(1);
+                }
+            };
+
+            if let Some(code) = status.code() {
+                ExitCode::from(code as u8)
+            } else if status.success() {
+                ExitCode::SUCCESS
+            } else {
+                // Exited due to signal, no exit code available — map to 1
+                ExitCode::from(1)
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() -> ExitCode {
+    eprintln!("crabsock-root-helper is only intended to run on Linux");
+    ExitCode::from(1)
+}
+
+
+
+
+
+
