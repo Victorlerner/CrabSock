@@ -100,10 +100,19 @@ pub fn build_singbox_config(cfg: &TunConfig, socks_host: String, socks_port: u16
     }
     #[cfg(target_os = "macos")]
     {
-        // On macOS prefer system stack and relaxed strict_route (some setups fail to apply default route with gVisor)
+        // On macOS default to system stack; allow env overrides for stack and strict_route
         if let Some(obj) = tun_inbound.as_object_mut() {
-            obj.insert("stack".to_string(), serde_json::Value::String("system".to_string()));
-            obj.insert("strict_route".to_string(), serde_json::Value::Bool(false));
+            let stack = std::env::var("SB_TUN_STACK").unwrap_or_else(|_| "system".to_string());
+            obj.insert("stack".to_string(), serde_json::Value::String(stack));
+            // Default to strict_route=true to ensure full-route takeover; can relax via SB_STRICT_ROUTE=0/false
+            let strict = std::env::var("SB_STRICT_ROUTE")
+                .ok()
+                .map(|v| {
+                    let v = v.to_ascii_lowercase();
+                    v == "1" || v == "true" || v == "yes" || v == "on"
+                })
+                .unwrap_or(true);
+            obj.insert("strict_route".to_string(), serde_json::Value::Bool(strict));
             // Allow overriding interface name via env (off by default)
             if let Ok(ifn) = std::env::var("SB_TUN_IFACE_NAME") {
                 if !ifn.is_empty() {

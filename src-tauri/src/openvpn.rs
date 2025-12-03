@@ -284,6 +284,7 @@ impl OpenVpnManager {
         let exe_name = exe.file_name().and_then(|s| s.to_str()).unwrap_or_default().to_ascii_lowercase();
         let looks_like_v3 = exe_name.contains("openvpn10") || version_line.to_ascii_lowercase().contains("openvpn 3");
         let mentions_management = help_out.contains("management");
+        #[allow(unused_mut)]
         let mut supports_management = !looks_like_v3 && mentions_management;
         // On macOS management caused parsing errors even when help said it's supported; disable for reliability.
         #[cfg(target_os = "macos")]

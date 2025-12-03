@@ -2,6 +2,7 @@ use anyhow::Result;
 use log::{info, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use std::io::ErrorKind;
 
 fn host_matches_bypass(_host: &str) -> bool { false }
 
@@ -36,7 +37,7 @@ async fn should_bypass(host: &str, port: u16) -> bool {
     #[cfg(target_os = "macos")]
     {
         use std::process::Command;
-        if let Ok(output) = Command::new("route").args(["-n", " ", host]).output() {
+        if let Ok(output) = Command::new("route").args(["-n", "get", host]).output() {
             if output.status.success() {
                 let text = String::from_utf8_lossy(&output.stdout).to_lowercase();
                 if text.contains("utun") || text.contains("pritunl") { return true; }
@@ -53,6 +54,7 @@ async fn socks5_connect_through(
     target_port: u16,
 ) -> Result<TcpStream> {
     let mut s = TcpStream::connect(format!("{}:{}", upstream_host, upstream_port)).await?;
+    let _ = s.set_nodelay(true);
     // greeting: version 5, 1 method, no-auth
     s.write_all(&[0x05, 0x01, 0x00]).await?;
     let mut resp = [0u8; 2];
@@ -77,12 +79,25 @@ async fn socks5_connect_through(
 }
 
 async fn relay(mut a: TcpStream, mut b: TcpStream) -> Result<()> {
-    let (mut ar, mut aw) = a.split();
-    let (mut br, mut bw) = b.split();
-    let c1 = tokio::io::copy(&mut ar, &mut bw);
-    let c2 = tokio::io::copy(&mut br, &mut aw);
-    let _ = tokio::try_join!(c1, c2)?;
-    Ok(())
+    let _ = a.set_nodelay(true);
+    let _ = b.set_nodelay(true);
+    match tokio::io::copy_bidirectional(&mut a, &mut b).await {
+        Ok((_ab, _ba)) => {
+            // Best-effort half-close on both ends
+            let _ = a.shutdown().await;
+            let _ = b.shutdown().await;
+            Ok(())
+        }
+        Err(e) => {
+            match e.kind() {
+                ErrorKind::BrokenPipe | ErrorKind::ConnectionReset | ErrorKind::NotConnected | ErrorKind::TimedOut => {
+                    // Treat common hang-up conditions as normal termination
+                    Ok(())
+                }
+                _ => Err(e.into()),
+            }
+        }
+    }
 }
 
 pub async fn run_acl_http_proxy(bind_addr: &str, socks_upstream: (&str, u16)) -> Result<()> {
@@ -90,6 +105,7 @@ pub async fn run_acl_http_proxy(bind_addr: &str, socks_upstream: (&str, u16)) ->
     info!("ACL HTTP proxy listening on {}", bind_addr);
     loop {
         let (mut client, peer) = listener.accept().await?;
+        let _ = client.set_nodelay(true);
         let (socks_host, socks_port) = (socks_upstream.0.to_string(), socks_upstream.1);
         tokio::spawn(async move {
             let mut buf = vec![0u8; 8192];

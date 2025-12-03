@@ -7,8 +7,6 @@ pub fn find_singbox_path() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let exe_dir = dir.to_path_buf();
-            #[allow(unused_mut)]
-            let mut chosen: Option<PathBuf> = None;
             #[cfg(target_os = "windows")]
             {
                 let mut candidates = vec![
@@ -91,7 +89,7 @@ pub fn find_singbox_path() -> Option<PathBuf> {
 
 #[cfg(target_os = "windows")]
 pub fn spawn_singbox(singbox_path: &Path, cfg_path: &Path) -> Result<tokio::process::Child> {
-    use std::os::windows::process::CommandExt;
+    use std::os::windows::process::CommandExt as _;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
     let mut child = Command::new(singbox_path)
         .creation_flags(CREATE_NO_WINDOW)

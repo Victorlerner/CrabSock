@@ -4,7 +4,6 @@ use shadowsocks_service::{
 };
 use shadowsocks::config::{ServerConfig, ServerAddr};
 use std::str::FromStr;
-use tokio::time::{timeout, Duration};
 
 #[derive(Debug, Clone)]
 pub struct ShadowsocksConfig {
@@ -60,17 +59,11 @@ impl ShadowsocksClient {
         log::info!("SOCKS5 proxy listening on 127.0.0.1:1080");
         log::info!("ACL HTTP proxy listening on 127.0.0.1:{}", http_port);
 
-        // Create and run the local server with timeout
+        // Create and run the local server (long-lived)
         let server = Server::new(config).await
             .map_err(|e| format!("Failed to create server: {}", e))?;
-        
-        // Start server with timeout to avoid hanging
-        let server_timeout = Duration::from_secs(300); // 5 minutes
-        
-        timeout(server_timeout, server.run()).await
-            .map_err(|e| {
-                format!("Server timeout or error: {}", e)
-            })?
+
+        server.run().await
             .map_err(|e| format!("Server error: {}", e))?;
 
         Ok(())

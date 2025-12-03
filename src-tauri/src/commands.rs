@@ -3,6 +3,7 @@ use crate::proxy::{ProxyManager, ConnectionStatus};
 use crate::config_manager::{ConfigManager, ConfigFile, AppSettings, RoutingMode};
 use crate::system_proxy::{SystemProxyManager, ProxySettings};
 use crate::tun_manager::TunManager;
+use crate::linux_capabilities::has_cap_net_admin;
 #[cfg(target_os = "windows")]
 use crate::windows_firewall::ensure_firewall_rules_allow;
 use once_cell::sync::Lazy;
@@ -84,18 +85,31 @@ fn macos_tun_routes_ready() -> bool {
             let mut has_utun_default = false;
             let mut has_half_0 = false;
             let mut has_half_128 = false;
+            // macOS sometimes prints segmented coverage instead of 0/1; track common segments via utun*
+            let mut seg_hits = 0usize;
+            let seg_targets = ["1", "2/7", "4/6", "8/5", "16/4", "32/3", "64/2"];
             for line in text.lines() {
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() < 7 { continue; }
+                // Typical macOS columns: Destination Gateway Flags Netif Expire
+                if parts.len() < 4 { continue; }
                 let dest = parts[0];
-                let netif = parts[6];
+                // Netif is usually the penultimate column
+                let netif_idx = if parts.len() >= 4 { parts.len().saturating_sub(2) } else { continue };
+                let netif = parts[netif_idx];
                 if netif.starts_with("utun") {
                     if dest == "default" { has_utun_default = true; }
                     if dest == "0/1" || dest == "0.0.0.0/1" { has_half_0 = true; }
                     if dest == "128/1" || dest == "128.0.0.0/1" { has_half_128 = true; }
+                    if seg_targets.iter().any(|t| t == &dest) {
+                        seg_hits += 1;
+                    }
                 }
             }
-            return has_utun_default || (has_half_0 && has_half_128);
+            // Consider ready if:
+            // - default route via utun*, or
+            // - both half routes present, or
+            // - 128/1 present and we see several segmented routes via utun* (covers 0/1 split pattern)
+            return has_utun_default || (has_half_0 && has_half_128) || (has_half_128 && seg_hits >= 4);
         }
     }
     false
@@ -257,6 +271,13 @@ pub async fn ensure_admin_for_tun() -> Result<bool, String> {
 #[tauri::command]
 pub async fn exit_app(app: tauri::AppHandle) -> Result<(), String> {
     // Ensure OpenVPN and sing-box are stopped before exiting
+    // Stop proxy pipelines (sing-box/shadowsocks) silently
+    disconnect_vpn_silent().await;
+    // Clear system proxy explicitly to avoid leaving broken settings
+    {
+        let mut system_manager = SYSTEM_PROXY_MANAGER.lock().await;
+        let _ = system_manager.clear_system_proxy().await;
+    }
     crate::openvpn::OpenVpnManager::disconnect_silent();
     let _ = app.exit(0);
     Ok(())
@@ -487,6 +508,7 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                         ip_info.ip, ip_info.country);
                     
                     // Save baseline IP for later change detection when TUN is enabled
+                    #[allow(unused_variables)]
                     let baseline_ip = ip_info.ip.clone();
                     let ip_result = window.emit("ip_verified", ip_info);
                     
@@ -545,13 +567,9 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                                         }
                                         if !ready {
-                                            log::warn!("[ROUTING][macOS] TUN routes not detected in time. Falling back to SystemProxy.");
-                                            let _ = disable_tun_mode().await;
-                                            let proxy_settings = ProxySettings::with_socks5("127.0.0.1", 1080);
-                                            let mut system_manager = SYSTEM_PROXY_MANAGER.lock().await;
-                                            let _ = system_manager.set_system_proxy(&proxy_settings).await;
+                                            log::warn!("[ROUTING][macOS] TUN routes not detected in time. Keeping TUN active and skipping early fallback.");
                                             let _ = window_clone.emit("status", StatusEvent { status: "connected".into() });
-                                            return;
+                                            // Continue without forcing fallback; IP change check below may still succeed
                                         }
                                         // After routes are ready, verify IP change (give up to ~10s)
                                         for _ in 0..20 {
@@ -645,6 +663,7 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                                     manager.mark_connected().await;
                                 }
                                 // Capture baseline IP before routing changes
+                                #[allow(unused_variables)]
                                 let baseline_ip = ip_info.ip.clone();
                                 let _ = window.emit("ip_verified", ip_info);
                                 let settings = ConfigManager::new().map_err(|e| e.to_string())?.load_configs().await.map_err(|e| e.to_string())?.settings;
@@ -689,13 +708,9 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                                             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                                         }
                                         if !ready {
-                                            log::warn!("[ROUTING][macOS] TUN routes not detected in time. Falling back to SystemProxy.");
-                                            let _ = disable_tun_mode().await;
-                                            let proxy_settings = ProxySettings::with_socks5("127.0.0.1", 1080);
-                                            let mut system_manager = SYSTEM_PROXY_MANAGER.lock().await;
-                                            let _ = system_manager.set_system_proxy(&proxy_settings).await;
+                                            log::warn!("[ROUTING][macOS] TUN routes not detected in time. Keeping TUN active and skipping early fallback.");
                                             let _ = window_clone.emit("status", StatusEvent { status: "connected".into() });
-                                            return;
+                                            // Continue without forcing fallback; IP change check below may still succeed
                                         }
                                         // After routes are ready, verify IP change (give up to ~10s)
                                         for _ in 0..20 {
@@ -777,11 +792,17 @@ pub async fn disconnect_vpn(window: tauri::Window) -> Result<(), String> {
 
     match result {
         Ok(_) => {
+            // Явно очищаем системный прокси на всех платформах (особенно Windows), чтобы не оставить "битый" прокси
+            {
+                let mut system_manager = SYSTEM_PROXY_MANAGER.lock().await;
+                let _ = system_manager.clear_system_proxy().await;
+            }
+
             let _ = window.emit("status", StatusEvent {
                 status: "disconnected".into(),
             });
 
-            let _ = tun_task.await; // wait for TUN shutdown
+            let _ = tun_task.await; // дожидаемся выключения TUN
             log::info!("[DISCONNECT] VPN disconnected");
             Ok(())
         }
@@ -1241,7 +1262,7 @@ pub async fn enable_tun_mode(window: tauri::Window) -> Result<(), String> {
                     
                     println!("[STDOUT] TUN mode enabled successfully - all traffic routed through VPN");
                     log::info!("[TUN] TUN mode enabled successfully");
-                    
+
                     // Check and send updated IP to frontend
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                     match get_ip().await {
@@ -1253,7 +1274,7 @@ pub async fn enable_tun_mode(window: tauri::Window) -> Result<(), String> {
                             log::warn!("[TUN] IP verification failed: {}", e);
                         }
                     }
-                    
+
                     Ok(())
                 }
                 Err(e) => {
@@ -1291,7 +1312,7 @@ pub async fn enable_tun_mode(window: tauri::Window) -> Result<(), String> {
                     }
                     println!("[STDOUT] TUN mode enabled successfully (direct outbound)");
                     log::info!("[TUN] TUN mode enabled successfully (direct outbound)");
-                    
+
                     // Check and send updated IP to frontend
                     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
                     match get_ip().await {
@@ -1303,7 +1324,7 @@ pub async fn enable_tun_mode(window: tauri::Window) -> Result<(), String> {
                             log::warn!("[TUN] IP verification failed: {}", e);
                         }
                     }
-                    
+
                     Ok(())
                 }
                 Err(e) => {
