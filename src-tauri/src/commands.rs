@@ -3,7 +3,6 @@ use crate::proxy::{ProxyManager, ConnectionStatus};
 use crate::config_manager::{ConfigManager, ConfigFile, AppSettings, RoutingMode};
 use crate::system_proxy::{SystemProxyManager, ProxySettings};
 use crate::tun_manager::TunManager;
-use crate::linux_capabilities::has_cap_net_admin;
 #[cfg(target_os = "windows")]
 use crate::windows_firewall::ensure_firewall_rules_allow;
 use once_cell::sync::Lazy;
