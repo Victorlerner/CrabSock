@@ -7,7 +7,6 @@ pub mod shadowsocks;
 pub mod config_manager;
 pub mod system_proxy;
 pub mod tun_manager;
-pub mod linux_capabilities;
 pub mod windows_firewall;
 pub mod acl_http_proxy;
 pub mod outbound;

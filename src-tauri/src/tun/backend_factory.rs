@@ -3,7 +3,7 @@ use anyhow::Result;
 use super::backend::TunBackend;
 
 #[cfg(target_os = "linux")]
-use super::linux_backend::LinuxTun;
+use super::linux_singbox_backend::LinuxSingBoxTun;
 #[cfg(target_os = "windows")]
 use super::windows_singbox_backend::WindowsSingBoxTun;
 #[cfg(target_os = "macos")]
@@ -27,9 +27,9 @@ impl TunBackendFactory {
 }
 
 #[cfg(target_os = "linux")]
-struct LinuxTunAdapter(LinuxTun);
+struct LinuxTunAdapter(LinuxSingBoxTun);
 #[cfg(target_os = "linux")]
-impl Default for LinuxTunAdapter { fn default() -> Self { LinuxTunAdapter(LinuxTun::new()) } }
+impl Default for LinuxTunAdapter { fn default() -> Self { LinuxTunAdapter(LinuxSingBoxTun::new()) } }
 #[cfg(target_os = "linux")]
 impl TunBackend for LinuxTunAdapter {
     fn start<'a>(&'a mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> { Box::pin(self.0.start()) }

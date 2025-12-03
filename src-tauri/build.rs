@@ -1,5 +1,5 @@
 fn main() {
-    // Ограничим список наблюдаемых файлов, чтобы cargo не лез в недоступные директории (например, pkg/)
+    // Limit watched files so that cargo does not scan inaccessible directories (e.g. pkg/)
     println!("cargo:rerun-if-changed=tauri.conf.json");
     println!("cargo:rerun-if-changed=icons/icon.png");
     println!("cargo:rerun-if-changed=src/");

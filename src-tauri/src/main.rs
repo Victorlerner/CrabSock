@@ -15,6 +15,18 @@ use tauri::menu::{Menu, MenuItem};
 use startup::activate_main_window;
 
 fn main() {
+    // On Linux disable WebKitGTK DMA-BUF renderer to avoid GPU/DRM permission issues when using capabilities/elevation
+    #[cfg(target_os = "linux")]
+    {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        // Increase RLIMIT_NOFILE to avoid EMFILE under TUN + proxy load
+        unsafe {
+            use libc::{rlimit, setrlimit, RLIMIT_NOFILE};
+            let lim = rlimit { rlim_cur: 262144, rlim_max: 262144 };
+            let _ = setrlimit(RLIMIT_NOFILE, &lim);
+        }
+    }
+
     // On Windows release builds: if launched from an existing console (cmd/powershell),
     // attach to it so stdout/stderr prints are visible. If started from Explorer, do nothing.
     #[cfg(all(windows, not(debug_assertions)))]
@@ -47,28 +59,10 @@ fn main() {
     let elevated_relaunch: bool = startup_args.elevated_relaunch;
     let routing_override: Option<String> = startup_args.routing_override.clone();
 
+    // On Linux sing-box is started via pkexec wrapper - capabilities are NOT required
     #[cfg(target_os = "linux")]
     {
-        let is_debug = cfg!(debug_assertions);
-        let skip = std::env::var("CRABSOCK_SKIP_CAP_CHECK").is_ok();
-        if !is_debug && !skip {
-            if !has_cap_net_admin() {
-                log::info!("[MAIN] cap_net_admin is missing, attempting to set via pkexec/sudo");
-                match set_cap_net_admin_via_pkexec().or_else(|_| set_cap_net_admin_via_sudo()) {
-                    Ok(_) => {
-                        log::info!("[MAIN] cap_net_admin successfully set on startup, restarting to apply capabilities");
-                        if let Ok(exe) = std::env::current_exe() {
-                            let args: Vec<String> = std::env::args().skip(1).collect();
-                            let _ = std::process::Command::new(exe).args(args).spawn();
-                        }
-                        std::process::exit(0);
-                    }
-                    Err(e) => log::warn!("[MAIN] Failed to set cap_net_admin on startup: {}", e),
-                }
-            }
-        } else {
-            log::info!("[MAIN] Skipping capability setup (debug build or CRABSOCK_SKIP_CAP_CHECK set)");
-        }
+        log::info!("[MAIN][LINUX] TUN mode will use pkexec wrapper - no capability setup needed");
     }
 
     // Cross-platform early-exit guard (only active on Windows) to avoid duplicates
@@ -118,9 +112,9 @@ fn main() {
 
     builder
         .setup(move |app| {
-            // Создаем трей-иконку и обрабатываем клики для показа окна
+            // Create tray icon and handle clicks to show window
             let icon = app.default_window_icon().cloned().expect("default window icon missing");
-            // Трей-меню
+            // Tray menu
             let show_item = MenuItem::with_id(app, "show", "Show app", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit app", true, None::<&str>)?;
             let menu = Menu::new(app)?;
@@ -134,11 +128,11 @@ fn main() {
                 .show_menu_on_left_click(true)
                 .on_tray_icon_event(|icon, event| {
                     match event {
-                        // ЛКМ открывает меню; даблклик показывает окно
+                        // Left click opens menu; double-click shows window
                         TrayIconEvent::DoubleClick { .. } => {
                             activate_main_window(&icon.app_handle());
                         }
-                        TrayIconEvent::Click { .. } => { /* меню покажет сам таури */ }
+                        TrayIconEvent::Click { .. } => { /* Tauri will show menu itself */ }
                         _ => {}
                     }
                 })
@@ -148,7 +142,7 @@ fn main() {
                             activate_main_window(&icon.app_handle());
                         }
                         "quit" => {
-                            // Грейсфул-шатдаун: сначала останавливаем прокси (убьёт sing-box), затем TUN и системный прокси
+                            // Graceful shutdown: first stop proxy (kills sing-box), then TUN and system proxy
                             let app = icon.app_handle().clone();
                             tauri::async_runtime::spawn(async move {
                                 // Stop proxy first (kills sing-box if running)
@@ -205,7 +199,7 @@ fn main() {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                // Сворачиваем в трей вместо выхода
+                // Minimize to tray instead of exiting
                 api.prevent_close();
                 let _ = window.hide();
             }
