@@ -197,15 +197,15 @@ impl SystemProxyManager {
         let de = detect_desktop_env();
         match de {
             DesktopEnv::Gnome if which("gsettings") => set_proxy_gnome(settings)?,
-            DesktopEnv::Kde if which("kwriteconfig5") => set_proxy_kde(settings)?,
+            DesktopEnv::Kde if kde_config_bin().is_some() => set_proxy_kde(settings)?,
             _ => {
                 // Try gsettings → KDE → otherwise do nothing (env already set)
                 if which("gsettings") {
                     set_proxy_gnome(settings)?;
-                } else if which("kwriteconfig5") {
+                } else if kde_config_bin().is_some() {
                     set_proxy_kde(settings)?;
                 } else {
-                    log::warn!("[SYSTEM_PROXY] No known system proxy backend found (gsettings/kwriteconfig5). Using env only.");
+                    log::warn!("[SYSTEM_PROXY] No known system proxy backend found (gsettings/kwriteconfig5/6). Using env only.");
                 }
             }
         }
@@ -621,6 +621,16 @@ fn which(bin: &str) -> bool {
     Command::new("which").arg(bin).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
 }
 
+fn kde_config_bin() -> Option<&'static str> {
+    if which("kwriteconfig5") {
+        Some("kwriteconfig5")
+    } else if which("kwriteconfig6") {
+        Some("kwriteconfig6")
+    } else {
+        None
+    }
+}
+
 fn set_proxy_gnome(settings: &ProxySettings) -> Result<()> {
     if let Some(ref http_proxy) = settings.http_proxy {
         if let Some(proxy_url) = http_proxy.strip_prefix("socks5://") {
@@ -650,32 +660,119 @@ fn set_proxy_gnome(settings: &ProxySettings) -> Result<()> {
 }
 
 fn set_proxy_kde(settings: &ProxySettings) -> Result<()> {
-    // KDE stores in kioslaverc; ProxyType: 0=no, 1=auto, 2=manual
+    // KDE stores in kioslaverc; ProxyType: 0=no proxy, 1=manual, 2=auto (PAC)
+    let bin = match kde_config_bin() {
+        Some(b) => b,
+        None => {
+            log::warn!("[SYSTEM_PROXY] kwriteconfig5/6 not found; cannot apply KDE proxy");
+            return Ok(());
+        }
+    };
+
     if let Some(ref http_proxy) = settings.http_proxy {
         if let Some(proxy_url) = http_proxy.strip_prefix("socks5://") {
             if let Some((host, port)) = proxy_url.split_once(':') {
-                Command::new("kwriteconfig5").args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "ProxyType", "2"]).output()?;
+                // Manual proxy mode
+                Command::new(bin).args([
+                    "--file", "kioslaverc",
+                    "--group", "Proxy Settings",
+                    "--key", "ProxyType",
+                    "1"
+                ]).output()?;
+
+                // SOCKS proxy. Older KDE uses socksProxy, newer UI also understands it.
                 let socks_value = format!("socks://{}:{}", host, port);
-                Command::new("kwriteconfig5").args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "socksProxy", &socks_value]).output()?;
-                // http/https empty to avoid forcing
-                Command::new("kwriteconfig5").args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "httpProxy", ""]).output()?;
-                Command::new("kwriteconfig5").args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "httpsProxy", ""]).output()?;
+                Command::new(bin).args([
+                    "--file", "kioslaverc",
+                    "--group", "Proxy Settings",
+                    "--key", "socksProxy",
+                    &socks_value
+                ]).output()?;
+
+                // HTTP proxy: point to local ACL HTTP proxy (127.0.0.1:8080).
+                // Do NOT set HTTPS proxy explicitly – many browsers break when HTTPS proxy is set separately.
+                let http_port = "8080";
+                let http_value = format!("http://{}:{}", host, http_port);
+                Command::new(bin).args([
+                    "--file", "kioslaverc",
+                    "--group", "Proxy Settings",
+                    "--key", "httpProxy",
+                    &http_value
+                ]).output()?;
+                Command::new(bin).args([
+                    "--file", "kioslaverc",
+                    "--group", "Proxy Settings",
+                    "--key", "httpsProxy",
+                    ""
+                ]).output()?;
+
                 // set bypass list if provided
                 if let Some(ref bypass) = settings.no_proxy {
-                    Command::new("kwriteconfig5").args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "NoProxyFor", bypass]).output()?;
+                    Command::new(bin).args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "NoProxyFor", bypass]).output()?;
                 }
-                // apply
-                let _ = Command::new("qdbus").args(["org.kde.kded5", "/kded", "reconfigure"]).stdout(Stdio::null()).stderr(Stdio::null()).output();
+
+                // Notify KIO / KDE of proxy change
+                let _ = Command::new("dbus-send")
+                    .args([
+                        "--type=signal",
+                        "/KIO/Scheduler",
+                        "org.kde.KIO.Scheduler.reparseSlaveConfiguration",
+                        "string:''",
+                    ])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .output();
+                // Fallbacks: try kded5/kded6 if present (ignored on failure)
+                let _ = Command::new("qdbus")
+                    .args(["org.kde.kded5", "/kded", "reconfigure"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .output();
+                let _ = Command::new("qdbus6")
+                    .args(["org.kde.kded6", "/kded6", "reconfigure"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .output();
+
                 log::info!("[SYSTEM_PROXY] KDE proxy set: {}:{}", host, port);
             }
         }
     } else {
         // disable
-        Command::new("kwriteconfig5").args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "ProxyType", "0"]).output()?;
-        Command::new("kwriteconfig5").args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "socksProxy", ""]).output()?;
+        Command::new(bin).args([
+            "--file", "kioslaverc",
+            "--group", "Proxy Settings",
+            "--key", "ProxyType",
+            "0"
+        ]).output()?;
+        Command::new(bin).args([
+            "--file", "kioslaverc",
+            "--group", "Proxy Settings",
+            "--key", "socksProxy",
+            ""
+        ]).output()?;
         // clear bypass
-        Command::new("kwriteconfig5").args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "NoProxyFor", ""]).output()?;
-        let _ = Command::new("qdbus").args(["org.kde.kded5", "/kded", "reconfigure"]).stdout(Stdio::null()).stderr(Stdio::null()).output();
+        Command::new(bin).args(["--file", "kioslaverc", "--group", "Proxy Settings", "--key", "NoProxyFor", ""]).output()?;
+        let _ = Command::new("dbus-send")
+            .args([
+                "--type=signal",
+                "/KIO/Scheduler",
+                "org.kde.KIO.Scheduler.reparseSlaveConfiguration",
+                "string:''",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output();
+        let _ = Command::new("qdbus")
+            .args(["org.kde.kded5", "/kded", "reconfigure"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output();
+        let _ = Command::new("qdbus6")
+            .args(["org.kde.kded6", "/kded6", "reconfigure"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output();
         log::info!("[SYSTEM_PROXY] KDE proxy disabled");
     }
     Ok(())
