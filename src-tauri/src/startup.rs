@@ -116,13 +116,41 @@ fn other_crabsock_instance_running() -> bool {
     false
 }
 
+/// Best-effort: bring existing CrabSock window to foreground on Windows.
+#[cfg(target_os = "windows")]
+fn focus_existing_main_window() {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    };
+
+    let title = "CrabSock";
+    let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+
+    unsafe {
+        let hwnd: HWND =
+            FindWindowW(None, PCWSTR(wide.as_ptr())).unwrap_or(HWND(std::ptr::null_mut()));
+        if !hwnd.0.is_null() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+            let _ = SetForegroundWindow(hwnd);
+        }
+    }
+}
+
 /// Decide whether this Windows process should exit immediately to avoid duplicates.
 #[cfg(target_os = "windows")]
 pub fn should_exit_early(elevated_relaunch: bool) -> bool {
-    if !elevated_relaunch && !is_elevated_process() && other_crabsock_instance_running() {
-        log::info!("[MAIN][WIN] Another CrabSock instance is already running; exiting this one.");
+    if elevated_relaunch {
+        return false;
+    }
+
+    if other_crabsock_instance_running() {
+        log::info!("[MAIN][WIN] Another CrabSock instance is already running; focusing it and exiting this one.");
+        focus_existing_main_window();
         return true;
     }
+
     false
 }
 
