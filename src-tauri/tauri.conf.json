@@ -23,20 +23,11 @@
     }
   },
   "bundle": {
-    "active": true,
-    "targets": ["deb", "rpm", "app", "dmg","msi"],
-    "macOS": {
-      "entitlements": "macos/host.entitlements"
-    },
-    "resources": [
-      "resources/sing-box/sing-box.exe",
-      "resources/sing-box/darwin/sing-box",
-      "resources/openvpn_win/openvpn_amd64",
-      "resources/openvpn_win/openvpn_arm64",
-      "resources/openvpn_macos/openvpn",
-      "resources/openvpn_macos/openvpn_arm64",
-      "resources/openvpn_macos/openvpn10"
-    ],
+  "active": true,
+  "targets": ["deb", "rpm", "app", "dmg","msi"],
+  "macOS": {
+    "entitlements": "macos/host.entitlements"
+  },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

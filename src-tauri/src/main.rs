@@ -5,9 +5,8 @@ mod startup;
 use crab_sock::commands::*;
 use crab_sock::utils::init_logging;
 use crab_sock::config_manager::ConfigManager;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use crab_sock::openvpn::OpenVpnManager;
-#[cfg(target_os = "linux")]
-use crab_sock::linux_capabilities::{has_cap_net_admin, set_cap_net_admin_via_pkexec, set_cap_net_admin_via_sudo};
 use tauri::Manager;
 use tauri::Emitter;
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
@@ -55,6 +54,7 @@ fn main() {
 
     // Parse CLI overrides (e.g., from elevation relaunch)
     let startup_args = startup::parse_startup_args();
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     let auto_ovpn: Option<String> = startup_args.auto_ovpn.clone();
     let elevated_relaunch: bool = startup_args.elevated_relaunch;
     let routing_override: Option<String> = startup_args.routing_override.clone();

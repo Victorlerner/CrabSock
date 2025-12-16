@@ -1,0 +1,18 @@
+{
+    "app": {
+      "windows": [
+        {
+          "additionalBrowserArgs": "--no-sandbox"
+        }
+      ]
+    },
+  
+    "bundle": {
+      "resources": [
+        "resources/sing-box/sing-box.exe",
+        "resources/openvpn_win/openvpn_amd64",
+        "resources/openvpn_win/openvpn_arm64"
+      ]
+    }
+  }
+  

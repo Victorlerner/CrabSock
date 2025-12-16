@@ -5,8 +5,10 @@ use tokio::process::Command;
 
 pub fn find_singbox_path() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
+        log::info!("[SING-BOX][PATH] current_exe: {:?}", exe);
         if let Some(dir) = exe.parent() {
             let exe_dir = dir.to_path_buf();
+            log::info!("[SING-BOX][PATH] exe_dir: {:?}", exe_dir);
             #[cfg(target_os = "windows")]
             {
                 let mut candidates = vec![
@@ -21,7 +23,7 @@ pub fn find_singbox_path() -> Option<PathBuf> {
                     }
                 }
                 for c in candidates {
-                    log::debug!("[SING-BOX][PATH] Checking candidate: {:?}", c);
+                    log::info!("[SING-BOX][PATH] Checking candidate: {:?}", c);
                     if c.exists() {
                         log::info!("[SING-BOX][PATH] Using sing-box binary at {:?}", c);
                         return Some(c);
@@ -49,7 +51,7 @@ pub fn find_singbox_path() -> Option<PathBuf> {
                     }
                 }
                 for c in candidates {
-                    log::debug!("[SING-BOX][PATH] Checking candidate: {:?}", c);
+                    log::info!("[SING-BOX][PATH] Checking candidate: {:?}", c);
                     if c.exists() {
                         log::info!("[SING-BOX][PATH] Using sing-box binary at {:?}", c);
                         return Some(c);
@@ -65,6 +67,9 @@ pub fn find_singbox_path() -> Option<PathBuf> {
                 // resources under current dir
                 candidates.push(exe_dir.join("resources").join("sing-box").join("linux").join("sing-box"));
                 candidates.push(exe_dir.join("resources").join("sing-box").join("sing-box"));
+                // System-wide install (e.g. Debian/Ubuntu .deb layout)
+                // Example from production: /usr/lib/CrabSock/resources/sing-box/linux/sing-box
+                candidates.push(PathBuf::from("/usr/lib/CrabSock/resources/sing-box/linux/sing-box"));
                 // parent crate resources (dev)
                 if let Some(target_dir) = exe_dir.parent() {
                     if let Some(crate_dir) = target_dir.parent() {
@@ -74,7 +79,7 @@ pub fn find_singbox_path() -> Option<PathBuf> {
                     }
                 }
                 for c in candidates {
-                    log::debug!("[SING-BOX][PATH] Checking candidate: {:?}", c);
+                    log::info!("[SING-BOX][PATH] Checking candidate: {:?}", c);
                     if c.exists() {
                         log::info!("[SING-BOX][PATH] Using sing-box binary at {:?}", c);
                         return Some(c);
@@ -265,6 +270,10 @@ pub fn spawn_singbox(singbox_path: &Path, cfg_path: &Path) -> Result<tokio::proc
                     );
                 }
             }
+            // System-wide install (e.g. Debian/Ubuntu .deb layout)
+            script_candidates.push(
+                PathBuf::from("/usr/lib/CrabSock/resources/install-openvpn-helper.sh"),
+            );
             let script = script_candidates
                 .into_iter()
                 .find(|p| p.exists() && p.is_file())
@@ -370,6 +379,10 @@ pub fn spawn_singbox(singbox_path: &Path, cfg_path: &Path) -> Result<tokio::proc
                         );
                     }
                 }
+                // System-wide install (e.g. Debian/Ubuntu .deb layout)
+                candidates.push(
+                    PathBuf::from("/usr/lib/CrabSock/resources/singbox-wrapper.sh"),
+                );
                 candidates.into_iter().find(|p| p.exists())
             } else {
                 None

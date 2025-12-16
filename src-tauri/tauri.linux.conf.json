@@ -1,0 +1,12 @@
+{
+  "bundle": {
+    "resources": [
+      "resources/singbox-wrapper.sh",
+      "resources/singbox-kill.sh",
+      "resources/sing-box/linux/sing-box",
+      "resources/install-openvpn-helper.sh"
+    ]
+  }
+}
+
+
