@@ -33,11 +33,36 @@ impl VlessClient {
     }
 
     fn build_singbox_config_json(&self) -> serde_json::Value {
-        let server = self.config.server.clone();
+        use std::net::{IpAddr, ToSocketAddrs};
+
+        let original_server = self.config.server.clone();
+        // Prefer connecting by IP to avoid sing-box doing its own DNS resolution for the upstream
+        // VLESS server (which may be blocked or misrouted once TUN is active). Preserve SNI so the
+        // TLS layer still sees the original hostname.
+        let mut server = original_server.clone();
+        if server.parse::<IpAddr>().is_err() {
+            if let Ok(iter) = (server.as_str(), self.config.port).to_socket_addrs() {
+                if let Some(ip) = iter.filter_map(|sa| {
+                    match sa.ip() {
+                        IpAddr::V4(v4) => Some(IpAddr::V4(v4)),
+                        IpAddr::V6(v6) => Some(IpAddr::V6(v6)),
+                    }
+                }).next() {
+                    log::info!("[VLESS] Resolved upstream host {} -> {}", server, ip);
+                    server = ip.to_string();
+                } else {
+                    log::warn!("[VLESS] Could not resolve upstream host {}; using hostname as-is", server);
+                }
+            } else {
+                log::warn!("[VLESS] DNS resolution failed for upstream host {}; using hostname as-is", server);
+            }
+        }
         let port = self.config.port;
         let uuid = self.config.uuid.clone().unwrap_or_default();
         let tls_enabled = self.config.tls.unwrap_or(false);
-        let sni = self.config.sni.clone().unwrap_or_default();
+        // For SNI prefer explicit config.sni; otherwise keep the original hostname,
+        // even if we dial by IP, to match typical VLESS/Reality setups.
+        let mut sni = self.config.sni.clone().unwrap_or_default();
         let network = self.config.network.clone().unwrap_or_else(|| "tcp".to_string());
         let ws_path = self.config.ws_path.clone().unwrap_or_default();
         let ws_headers = self.config.ws_headers.clone().unwrap_or_default();
@@ -51,6 +76,10 @@ impl VlessClient {
             "[VLESS] Config summary: server={} port={} tls={} sni={} fp={} flow={} net={} ws_path={}",
             server, port, tls_enabled, sni, fingerprint, flow, network, ws_path
         );
+
+        if sni.is_empty() {
+            sni = original_server;
+        }
 
         let mut outbound = serde_json::json!({
             "type": "vless",
@@ -87,7 +116,12 @@ impl VlessClient {
         // Provide both HTTP (for WinINET/system proxy) and SOCKS inbounds.
         // HTTP port is taken from ACL_HTTP_PORT if set and available; otherwise
         // we auto-select a free port starting from 2081, mirroring Shadowsocks ACL HTTP.
-        let sb_log_level = std::env::var("SB_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+        //
+        // Default sing-box log level: on Linux use "warn" to reduce noise, elsewhere "info".
+        // Can always be overridden via SB_LOG_LEVEL.
+        let default_log_level = if cfg!(target_os = "linux") { "warn" } else { "info" };
+        let sb_log_level =
+            std::env::var("SB_LOG_LEVEL").unwrap_or_else(|_| default_log_level.to_string());
         let http_port: u16 = crate::utils::ensure_acl_http_port_initialized();
         serde_json::json!({
             "log": { "level": sb_log_level, "timestamp": true },
@@ -405,7 +439,8 @@ mod tests {
     fn build_config_ws_and_tls_fields_present() {
         let c = VlessClient::new(cfg_ws_tls());
         let j: Value = c.build_singbox_config_json();
-        assert_eq!(j["log"]["level"], "info");
+        // Default log level may differ by platform; just ensure it is a string.
+        assert!(j["log"]["level"].is_string());
         // Expect both HTTP and SOCKS inbounds (order and ports are not enforced).
         let mut has_http = false;
         let mut has_socks = false;
