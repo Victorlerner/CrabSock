@@ -50,8 +50,6 @@ fn main() {
     }
 
     init_logging();
-    // Initialize shared ACL HTTP port (used by sing-box HTTP inbound and SystemProxy integration).
-    crab_sock::utils::ensure_acl_http_port_initialized();
     log::info!("[MAIN] Starting CrabSock Tauri app");
 
     // Parse CLI overrides (e.g., from elevation relaunch)

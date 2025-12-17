@@ -26,8 +26,9 @@ pub fn ensure_acl_http_port_initialized() -> u16 {
     if let Ok(val) = std::env::var("ACL_HTTP_PORT") {
         if let Ok(port) = val.parse::<u16>() {
             if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
+                // Port is free — release it immediately and use this value.
                 drop(listener);
-                log::info!("[ACL_HTTP] Using pre-configured ACL HTTP port {}", port);
+                log::info!("[ACL_HTTP] Using pre-configured ACL_HTTP_PORT={}", port);
                 return port;
             } else {
                 log::warn!(
@@ -38,10 +39,10 @@ pub fn ensure_acl_http_port_initialized() -> u16 {
         }
     }
 
+    // 2) Try to find a free port in the preferred range and persist it.
     for offset in 0..RANGE_LEN {
         let port = PREFERRED_START.saturating_add(offset);
         if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
-            // Port is free — release it immediately and use this value.
             drop(listener);
             std::env::set_var("ACL_HTTP_PORT", port.to_string());
             log::info!("[ACL_HTTP] Selected ACL HTTP port {}", port);
@@ -49,6 +50,7 @@ pub fn ensure_acl_http_port_initialized() -> u16 {
         }
     }
 
+    // 3) Last resort – return the default start without binding.
     log::warn!(
         "[ACL_HTTP] Failed to find free ACL HTTP port in range {}-{}; falling back to {}",
         PREFERRED_START,
