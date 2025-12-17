@@ -1,0 +1,15 @@
+{
+    "bundle": {
+      "macOS": {
+        "entitlements": "macos/host.entitlements"
+      },
+  
+      "resources": [
+        "resources/sing-box/darwin/sing-box",
+        "resources/openvpn_macos/openvpn",
+        "resources/openvpn_macos/openvpn_arm64",
+        "resources/openvpn_macos/openvpn10"
+      ]
+    }
+  }
+  

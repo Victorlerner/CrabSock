@@ -5,6 +5,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/");
     println!("cargo:rerun-if-changed=!pkg");
     println!("cargo:rerun-if-changed=resources/sing-box/sing-box.exe");
+    println!("cargo:rerun-if-changed=resources/sing-box/linux/sing-box");
     println!("cargo:rerun-if-changed=resources/openvpn_win/");
     println!("cargo:rerun-if-changed=resources/openvpn_macos/");
 
