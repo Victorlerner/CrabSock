@@ -48,14 +48,14 @@ impl ShadowsocksClient {
         // Also start an ACL-aware HTTP CONNECT proxy on 127.0.0.1:<ACL_HTTP_PORT> that bypasses internal domains to DIRECT
         // and forwards the rest via SOCKS5 (127.0.0.1:1080). This ensures browsers always hit our ACL first.
         tokio::spawn(async move {
-            let http_port: u16 = std::env::var("ACL_HTTP_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8080);
+            let http_port: u16 = crate::utils::ensure_acl_http_port_initialized();
             let bind = format!("127.0.0.1:{}", http_port);
             if let Err(e) = crate::acl_http_proxy::run_acl_http_proxy(&bind, ("127.0.0.1", 1080)).await {
                 log::error!("ACL HTTP proxy error: {}", e);
             }
         });
 
-        let http_port: u16 = std::env::var("ACL_HTTP_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8080);
+        let http_port: u16 = crate::utils::ensure_acl_http_port_initialized();
         log::info!("SOCKS5 proxy listening on 127.0.0.1:1080");
         log::info!("ACL HTTP proxy listening on 127.0.0.1:{}", http_port);
 

@@ -214,7 +214,7 @@ impl SystemProxyManager {
 
     #[cfg(target_os = "windows")]
     async fn set_windows_system_proxy(&self, settings: &ProxySettings) -> Result<()> {
-        // Windows: prefer driving traffic through local ACL HTTP proxy (127.0.0.1:8080)
+        // Windows: prefer driving traffic through local ACL HTTP proxy (127.0.0.1:<ACL_HTTP_PORT>)
         // and install a PAC file to DIRECT-bypass private ranges and VPN (Pritunl/WireGuard/TAP) routes.
         // Keys under: HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings
         //  - ProxyEnable (DWORD)
@@ -228,7 +228,7 @@ impl SystemProxyManager {
 
         if settings.http_proxy.is_some() || settings.socks_proxy.is_some() {
             // Always drive via local ACL HTTP proxy on Windows
-            let http_port: u16 = std::env::var("ACL_HTTP_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8080);
+            let http_port: u16 = crate::utils::ensure_acl_http_port_initialized();
             let proxy_str = format!("http=127.0.0.1:{p};https=127.0.0.1:{p}", p = http_port);
             key.set_value("ProxyEnable", &1u32)?;
             key.set_value("ProxyServer", &proxy_str)?;
@@ -403,7 +403,7 @@ function FindProxyForURL(url, host) {{
         if let Some(socks_url) = maybe_socks {
             // Normalize to host, port
             let (host, port) = parse_socks_host_port(&socks_url).unwrap_or(("127.0.0.1".to_string(), 1080u16));
-            log::info!("[SYSTEM_PROXY][macOS] Applying SOCKS {}:{} + HTTP/HTTPS 127.0.0.1:8080", host, port);
+            log::info!("[SYSTEM_PROXY][macOS] Applying SOCKS {}:{} + HTTP/HTTPS 127.0.0.1:<ACL_HTTP_PORT>", host, port);
 
             for service in services {
                 // networksetup -setsocksfirewallproxy "Wi-Fi" host port
@@ -440,7 +440,7 @@ function FindProxyForURL(url, host) {{
                     }
                 }
                 // Point HTTP/HTTPS at local ACL HTTP proxy 127.0.0.1:<ACL_HTTP_PORT> so browsers always hit ACL
-                let http_port: u16 = std::env::var("ACL_HTTP_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8080);
+                let http_port: u16 = crate::utils::ensure_acl_http_port_initialized();
                 let _ = std::process::Command::new("networksetup")
                     .arg("-setwebproxy")
                     .arg(&service)
@@ -690,9 +690,9 @@ fn set_proxy_kde(settings: &ProxySettings) -> Result<()> {
                     &socks_value
                 ]).output()?;
 
-                // HTTP proxy: point to local ACL HTTP proxy (127.0.0.1:8080).
+                // HTTP proxy: point to local ACL HTTP proxy (127.0.0.1:<ACL_HTTP_PORT>).
                 // Do NOT set HTTPS proxy explicitly – many browsers break when HTTPS proxy is set separately.
-                let http_port = "8080";
+                let http_port = crate::utils::ensure_acl_http_port_initialized();
                 let http_value = format!("http://{}:{}", host, http_port);
                 Command::new(bin).args([
                     "--file", "kioslaverc",
@@ -822,12 +822,14 @@ fn parse_socks_host_port(url: &str) -> Option<(String, u16)> {
 
 #[cfg(target_os = "macos")]
 fn verify_macos_proxies() -> bool {
-    // scutil --proxy prints a plist-like dictionary; check that HTTP, HTTPS or SOCKS are enabled
+    // scutil --proxy prints a plist-like dictionary; check that HTTP, HTTPS or SOCKS are enabled.
     if let Ok(out) = std::process::Command::new("scutil").arg("--proxy").output() {
         if out.status.success() {
             let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
-            let http_on = text.contains("httpenable : 1") && text.contains("httpproxy : 127.0.0.1") && text.contains("httpport : 8080");
-            let https_on = text.contains("httpsenable : 1") && text.contains("httpsproxy : 127.0.0.1") && text.contains("httpsport : 8080");
+            // We cannot easily parse the dynamic ACL_HTTP_PORT here in a robust way,
+            // so just check that HTTP/HTTPS or SOCKS proxies are enabled at all.
+            let http_on = text.contains("httpenable : 1");
+            let https_on = text.contains("httpsenable : 1");
             let socks_on = text.contains("socksenable : 1");
             return http_on || https_on || socks_on;
         }

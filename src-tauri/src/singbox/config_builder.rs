@@ -143,7 +143,10 @@ pub fn build_singbox_config(cfg: &TunConfig, socks_host: String, socks_port: u16
             "servers": [
                 {
                     "tag": "dns-remote",
-                    "address": "8.8.8.8"
+                    // IMPORTANT: force TCP DNS over the proxy to avoid UDP/53 and
+                    // udp_over_tcp-on-SOCKS issues (which cause EOF in local ss-local).
+                    "address": "tcp://8.8.8.8:53",
+                    "detour": "proxy"
                 },
                 {
                     "tag": "dns-block",

@@ -318,7 +318,10 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
         .map_err(|e| e.to_string())?
         .settings
         .routing_mode;
-
+    // Fast-path "direct to TUN without local proxy" is only enabled on non-Linux platforms.
+    // On Linux we always go through the local proxy first and then enable TUN on top of it,
+    // which matches the stable Shadowsocks flow and avoids VLESS-specific regressions.
+    #[cfg(not(target_os = "linux"))]
     if matches!(desired_mode, RoutingMode::Tun) {
         // Do NOT start Rust proxy in TUN mode. Configure sing-box outbound directly to upstream.
         log::info!("[CONNECT] Routing mode is TUN — skipping local proxy, configuring sing-box outbound");
@@ -416,7 +419,6 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                         std::env::remove_var("SB_SS_METHOD");
                         std::env::remove_var("SB_SS_PASSWORD");
                         std::env::set_var("SB_OUTBOUND_TYPE", "vless");
-                        std::env::remove_var("ACL_HTTP_PORT"); // use default 8080 for sing-box http inbound
                         std::env::set_var("SB_VLESS_SERVER", &config.server);
                         std::env::set_var("SB_VLESS_PORT", config.port.to_string());
                         if let Some(uuid) = &config.uuid { std::env::set_var("SB_VLESS_UUID", uuid); }
