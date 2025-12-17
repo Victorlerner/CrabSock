@@ -1,5 +1,5 @@
 use anyhow::Result;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::path::PathBuf;
 
 use crate::tun_manager::TunConfig;
@@ -54,21 +54,97 @@ pub fn build_singbox_config(cfg: &TunConfig, socks_host: String, socks_port: u16
     // In sing-box 1.11+ we no longer need special outbounds (dns, block),
     // rule actions are used instead.
 
-    // DNS configuration for sing-box 1.12+:
-    // use public DNS (8.8.8.8) over UDP – simpler than DoH and without loops.
-    let mut dns_rules: Vec<serde_json::Value> = Vec::new();
-    
-    // Block unwanted DNS queries
-    dns_rules.push(json!({ 
-        "query_type": [32, 33], 
-        "server": "dns-block",
-        "disable_cache": true
-    }));
-    dns_rules.push(json!({ 
-        "domain_suffix": [".lan"], 
-        "server": "dns-block",
-        "disable_cache": true
-    }));
+    // DNS configuration for sing-box 1.12+ in TUN mode.
+    //
+    // Для VLESS в TUN-режиме используем DoH-конфиг, похожий на Nekoray.
+    // Для остальных (socks/shadowsocks) оставляем прежнюю простую схему с 8.8.8.8,
+    // чтобы не ломать существующие настройки.
+    let dns: Value;
+    if std::env::var("SB_OUTBOUND_TYPE").ok().as_deref() == Some("vless") {
+        let mut dns_rules: Vec<Value> = Vec::new();
+
+        // Prefer resolving upstream proxy host via direct DoH when available.
+        if let Ok(upstream_host) = std::env::var("SB_VLESS_SERVER") {
+            if !upstream_host.is_empty() {
+                dns_rules.push(json!({
+                    "domain": [ upstream_host ],
+                    "server": "dns-direct"
+                }));
+            }
+        }
+
+        // Block unwanted DNS query types (SVCB/HTTPS).
+        dns_rules.push(json!({
+            "query_type": [32, 33],
+            "server": "dns-block",
+            "disable_cache": true
+        }));
+        // Block .lan domains.
+        dns_rules.push(json!({
+            "domain_suffix": [".lan"],
+            "server": "dns-block",
+            "disable_cache": true
+        }));
+
+        dns = json!({
+            "independent_cache": true,
+            "final": "dns-remote",
+            "servers": [
+                {
+                    "tag": "dns-remote",
+                    "address": "https://dns.google/dns-query",
+                    "address_resolver": "dns-local",
+                    "detour": "proxy",
+                    "strategy": ""
+                },
+                {
+                    "tag": "dns-direct",
+                    "address": "https://doh.pub/dns-query",
+                    "address_resolver": "dns-local",
+                    "detour": "direct",
+                    "strategy": ""
+                },
+                {
+                    "tag": "dns-block",
+                    "address": "rcode://success"
+                },
+                {
+                    "tag": "dns-local",
+                    "address": "local",
+                    "detour": "direct"
+                }
+            ],
+            "rules": dns_rules
+        });
+    } else {
+        let mut dns_rules: Vec<Value> = Vec::new();
+        // Block unwanted DNS queries
+        dns_rules.push(json!({
+            "query_type": [32, 33],
+            "server": "dns-block",
+            "disable_cache": true
+        }));
+        dns_rules.push(json!({
+            "domain_suffix": [".lan"],
+            "server": "dns-block",
+            "disable_cache": true
+        }));
+
+        dns = json!({
+            "servers": [
+                {
+                    "tag": "dns-remote",
+                    "address": "8.8.8.8"
+                },
+                {
+                    "tag": "dns-block",
+                    "address": "rcode://success"
+                }
+            ],
+            "rules": dns_rules,
+            "final": "dns-remote"
+        });
+    }
 
     // Build TUN inbound.
     //
@@ -122,7 +198,7 @@ pub fn build_singbox_config(cfg: &TunConfig, socks_host: String, socks_port: u16
         }
     }
 
-    let mut inbounds: Vec<serde_json::Value> = vec![tun_inbound];
+    let mut inbounds: Vec<Value> = vec![tun_inbound];
     if std::env::var("SINGBOX_ENABLE_MIXED").ok().as_deref() == Some("1") {
         let mixed_port: u16 = std::env::var("SINGBOX_MIXED_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(1081);
         log::info!("[SING-BOX][CONFIG] Enabling mixed inbound on 127.0.0.1:{mixed_port}");
@@ -139,26 +215,13 @@ pub fn build_singbox_config(cfg: &TunConfig, socks_host: String, socks_port: u16
     let doc = json!({
         "log": { "level": sb_log_level, "timestamp": true },
         "inbounds": inbounds,
-        "dns": {
-            "servers": [
-                {
-                    "tag": "dns-remote",
-                    "address": "8.8.8.8"
-                },
-                {
-                    "tag": "dns-block",
-                    "address": "rcode://success"
-                }
-            ],
-            "rules": dns_rules,
-            "final": "dns-remote"
-        },
+        "dns": dns,
         "outbounds": outbounds,
         "route": {
             "auto_detect_interface": true,
             "final": "proxy",
             "rules": [
-                // DNS hijack - intercept all DNS traffic through TUN
+                // DNS hijack - intercept all DNS traffic through TUN and send via DNS pipeline
                 { "protocol": "dns", "action": "hijack-dns" },
                 // Local networks go directly
                 { "ip_cidr": direct_cidrs, "outbound": "direct" },

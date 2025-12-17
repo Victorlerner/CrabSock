@@ -416,7 +416,7 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
                         std::env::remove_var("SB_SS_METHOD");
                         std::env::remove_var("SB_SS_PASSWORD");
                         std::env::set_var("SB_OUTBOUND_TYPE", "vless");
-                        std::env::remove_var("ACL_HTTP_PORT"); // use default 8080 for sing-box http inbound
+                        // Do not touch ACL_HTTP_PORT here; it is initialized globally and shared across components.
                         std::env::set_var("SB_VLESS_SERVER", &config.server);
                         std::env::set_var("SB_VLESS_PORT", config.port.to_string());
                         if let Some(uuid) = &config.uuid { std::env::set_var("SB_VLESS_UUID", uuid); }

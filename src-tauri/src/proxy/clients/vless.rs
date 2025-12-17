@@ -86,10 +86,11 @@ impl VlessClient {
 
         // Provide both HTTP (for WinINET/system proxy) and SOCKS inbounds
         let sb_log_level = std::env::var("SB_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
+        let http_port = crate::utils::ensure_acl_http_port_initialized();
         serde_json::json!({
             "log": { "level": sb_log_level, "timestamp": true },
             "inbounds": [
-                { "type": "http",  "listen": "127.0.0.1", "listen_port": 8080, "sniff": true },
+                { "type": "http",  "listen": "127.0.0.1", "listen_port": http_port, "sniff": true },
                 { "type": "socks", "listen": "127.0.0.1", "listen_port": 1080, "sniff": true, "sniff_override_destination": true }
             ],
             "outbounds": [ outbound ]
@@ -400,17 +401,20 @@ mod tests {
 
     #[test]
     fn build_config_ws_and_tls_fields_present() {
+        // Ensure deterministic HTTP port in tests by using the same helper that runtime uses.
+        let expected_http_port = crate::utils::ensure_acl_http_port_initialized();
+
         let c = VlessClient::new(cfg_ws_tls());
         let j: Value = c.build_singbox_config_json();
         assert_eq!(j["log"]["level"], "info");
-        // Expect both HTTP:8080 and SOCKS:1080 inbounds (order not enforced)
+        // Expect both HTTP:<expected_http_port> and SOCKS:1080 inbounds (order not enforced).
         let mut has_http = false;
         let mut has_socks = false;
         if let Some(arr) = j["inbounds"].as_array() {
             for ib in arr {
                 let t = ib["type"].as_str().unwrap_or("");
                 let p = ib["listen_port"].as_i64().unwrap_or_default();
-                if t == "http" && p == 8080 { has_http = true; }
+                if t == "http" && p == expected_http_port as i64 { has_http = true; }
                 if t == "socks" && p == 1080 { has_socks = true; }
             }
         }
