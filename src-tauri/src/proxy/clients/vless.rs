@@ -117,9 +117,9 @@ impl VlessClient {
         // HTTP port is taken from ACL_HTTP_PORT if set and available; otherwise
         // we auto-select a free port starting from 2081, mirroring Shadowsocks ACL HTTP.
         //
-        // Default sing-box log level: on Linux use "warn" to reduce noise, elsewhere "info".
+        // Default sing-box log level to "warn" to reduce noise.
         // Can always be overridden via SB_LOG_LEVEL.
-        let default_log_level = if cfg!(target_os = "linux") { "warn" } else { "info" };
+        let default_log_level = "warn";
         let sb_log_level =
             std::env::var("SB_LOG_LEVEL").unwrap_or_else(|_| default_log_level.to_string());
         let http_port: u16 = crate::utils::ensure_acl_http_port_initialized();
