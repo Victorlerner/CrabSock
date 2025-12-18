@@ -56,6 +56,7 @@ fn main() {
     let startup_args = startup::parse_startup_args();
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     let auto_ovpn: Option<String> = startup_args.auto_ovpn.clone();
+    let auto_proxy: Option<String> = startup_args.auto_proxy.clone();
     let elevated_relaunch: bool = startup_args.elevated_relaunch;
     let routing_override: Option<String> = startup_args.routing_override.clone();
 
@@ -193,6 +194,52 @@ fn main() {
                         log::info!("[MAIN] Auto OpenVPN connect started for '{}'", name);
                     }
                 });
+                }
+            }
+
+            // If relaunched elevated with --proxy-connect, connect after window becomes available.
+            // This is used on Windows to resume a TUN connection request after UAC elevation.
+            if elevated_relaunch {
+                if let Some(proxy_name) = auto_proxy.clone() {
+                    let app_handle = app.handle().clone();
+                    std::thread::spawn(move || {
+                        // Wait up to ~5s for the main window to exist
+                        let mut win_opt: Option<tauri::Window> = None;
+                        for _ in 0..50 {
+                            if let Some(w) = app_handle.get_webview_window("main") {
+                                // Convert WebviewWindow -> Window (stable API).
+                                win_opt = Some(w.as_ref().window());
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                        let Some(window) = win_opt else {
+                            log::error!("[MAIN] Auto proxy connect: main window not ready");
+                            return;
+                        };
+
+                        tauri::async_runtime::spawn(async move {
+                            match ConfigManager::new() {
+                                Ok(manager) => {
+                                    match manager.load_configs().await {
+                                        Ok(file) => {
+                                            if let Some(cfg) = file.configs.into_iter().find(|c| c.name == proxy_name) {
+                                                log::info!("[MAIN] Auto proxy connect started for '{}'", proxy_name);
+                                                if let Err(e) = connect_vpn(window.clone(), cfg).await {
+                                                    log::error!("[MAIN] Auto proxy connect failed: {}", e);
+                                                    let _ = window.emit("error", serde_json::json!({ "message": e }));
+                                                }
+                                            } else {
+                                                log::error!("[MAIN] Auto proxy connect: config '{}' not found", proxy_name);
+                                            }
+                                        }
+                                        Err(e) => log::error!("[MAIN] Auto proxy connect: failed to load configs: {}", e),
+                                    }
+                                }
+                                Err(e) => log::error!("[MAIN] Auto proxy connect: failed to init ConfigManager: {}", e),
+                            }
+                        });
+                    });
                 }
             }
             Ok(())

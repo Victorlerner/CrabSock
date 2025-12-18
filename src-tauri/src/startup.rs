@@ -4,6 +4,7 @@ use tauri::Manager;
 /// Parsed command-line options relevant for startup/elevation flows.
 pub struct StartupArgs {
     pub auto_ovpn: Option<String>,
+    pub auto_proxy: Option<String>,
     pub elevated_relaunch: bool,
     pub routing_override: Option<String>,
 }
@@ -11,6 +12,7 @@ pub struct StartupArgs {
 /// Parse CLI overrides (e.g. from elevation relaunch) and persist routing changes if requested.
 pub fn parse_startup_args() -> StartupArgs {
     let mut auto_ovpn: Option<String> = None;
+    let mut auto_proxy: Option<String> = None;
     let mut elevated_relaunch: bool = false;
     let mut routing_override: Option<String> = None;
 
@@ -42,12 +44,21 @@ pub fn parse_startup_args() -> StartupArgs {
         auto_ovpn = Some(val);
     }
 
+    if let Some(arg) = args.iter().find(|a| a.starts_with("--proxy-connect=")) {
+        let val = arg
+            .trim_start_matches("--proxy-connect=")
+            .trim_matches('"')
+            .to_string();
+        auto_proxy = Some(val);
+    }
+
     if args.iter().any(|a| a == "--elevated-relaunch") {
         elevated_relaunch = true;
     }
 
     StartupArgs {
         auto_ovpn,
+        auto_proxy,
         elevated_relaunch,
         routing_override,
     }

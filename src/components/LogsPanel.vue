@@ -50,7 +50,7 @@ function formatTime(date: Date) {
       </div>
     </div>
     
-    <div class="max-h-64 overflow-y-auto nice-scroll">
+    <div class="max-h-48 sm:max-h-56 md:max-h-64 overflow-y-auto nice-scroll">
       <div v-if="logs.length === 0" class="p-4 text-center text-gray-500 dark:text-gray-400">
         No logs yet
       </div>

@@ -204,6 +204,35 @@ export const useVpnStore = defineStore('vpn', {
         this.addLog('error', `Failed to start monitoring: ${e}`, 'frontend')
       }
 
+      // Restore last selected config (for showing active/disconnect button after restart/elevation relaunch)
+      try {
+        const raw = localStorage.getItem('crabsock:last_selected_config')
+        if (raw) {
+          const saved = JSON.parse(raw) as { server?: string; port?: number; proxy_type?: string; name?: string }
+          const found = this.configs.find(c =>
+            (saved.name && c.name === saved.name) ||
+            (saved.server && saved.port && saved.proxy_type &&
+              c.server === saved.server && c.port === saved.port && c.proxy_type === saved.proxy_type)
+          )
+          if (found) {
+            this.parsedConfig = found
+            this.rawConfig = this.configToString(found)
+          }
+        }
+      } catch { /* ignore */ }
+
+      // Sync initial status from backend (important when we auto-connect before frontend listeners attach)
+      try {
+        const s = String(await invoke('get_status') as string).toLowerCase()
+        const mapped: Status = (s === 'connected' || s === 'connecting') ? (s as Status) : 'disconnected'
+        this.status = mapped
+        if (mapped !== 'disconnected') {
+          this.showConfig = false
+        }
+      } catch (e) {
+        // ignore
+      }
+
       // На старте приложения показываем текущий внешний IP (без VPN)
       try {
         await this.refreshIp()
@@ -474,6 +503,14 @@ export const useVpnStore = defineStore('vpn', {
       this.parsedConfig = config
       this.rawConfig = this.configToString(config)
       this.addLog('info', `Selected config: ${config.name}`, 'frontend')
+      try {
+        localStorage.setItem('crabsock:last_selected_config', JSON.stringify({
+          name: config.name,
+          server: config.server,
+          port: config.port,
+          proxy_type: config.proxy_type,
+        }))
+      } catch { /* ignore */ }
     },
     
     removeConfig(config: ParsedConfig) {

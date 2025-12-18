@@ -71,7 +71,7 @@ function getProxyColor(proxyType: string) {
       <h3 class="text-lg font-semibold">Saved Configs</h3>
     </div>
     
-    <div class="max-h-64 overflow-y-auto">
+    <div class="max-h-48 sm:max-h-56 md:max-h-64 overflow-y-auto nice-scroll">
       <div v-if="configs.length === 0" class="p-4 text-center text-gray-500 dark:text-gray-400">
         No configs saved yet
       </div>
