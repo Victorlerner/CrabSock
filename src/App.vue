@@ -16,10 +16,10 @@ onMounted(() => store.init())
 </script>
 
 <template>
-  <div class="min-h-full bg-gray-50 dark:bg-neutral-900 text-gray-900 dark:text-gray-100">
-    <div class="mx-auto p-6 space-y-6">
-      <header class="flex items-center justify-between">
-        <img src="/app-icon.png" alt="App icon" class="w-16 h-16" />
+  <div class="h-full bg-gray-50 dark:bg-neutral-900 text-gray-900 dark:text-gray-100">
+    <div class="mx-auto h-full p-3 sm:p-4 md:p-6 flex flex-col gap-4 md:gap-6">
+      <header class="flex items-center justify-between gap-3 shrink-0">
+        <img src="/app-icon.png" alt="App icon" class="w-12 h-12 sm:w-14 sm:h-14 md:w-16 md:h-16 shrink-0" />
         <div class="flex items-center gap-2">
          
           <h1 class="text-2xl font-semibold">CrabSock</h1>
@@ -29,14 +29,14 @@ onMounted(() => store.init())
 
 
       <!-- Loading State -->
-      <section v-if="store.status === 'connecting'" class="bg-white/70 dark:bg-neutral-800 rounded-xl border border-gray-200/60 dark:border-neutral-700">
+      <section v-if="store.status === 'connecting'" class="bg-white/70 dark:bg-neutral-800 rounded-xl border border-gray-200/60 dark:border-neutral-700 shrink-0">
         <LoadingSpinner />
       </section>
 
       <!-- Main Content Grid -->
-      <div v-else class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <div v-else class="grid grid-cols-1 sm:grid-cols-2 gap-4 md:gap-6 flex-1 min-h-0">
         <!-- Left Column: Config Input and Status -->
-        <div class="space-y-6">
+        <div class="flex flex-col gap-4 md:gap-6 min-h-0 overflow-y-auto nice-scroll pr-1">
           <!-- Connection Status -->
           <ConnectionStatus />
           
@@ -54,7 +54,7 @@ onMounted(() => store.init())
         </div>
 
         <!-- Right Column: Configs and Logs -->
-        <div class="space-y-6">
+        <div class="flex flex-col gap-4 md:gap-6 min-h-0 overflow-y-auto nice-scroll pr-1">
           <ConfigList />
 
           <Settings />

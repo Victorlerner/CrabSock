@@ -17,6 +17,7 @@ use std::os::windows::process::CommandExt;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 use crate::openvpn;
 use crate::openvpn::{OpenVpnManager, OpenVpnConfigInfo};
+use tauri::Manager;
 
 #[cfg(target_os = "macos")]
 fn is_root_macos() -> bool {
@@ -323,6 +324,24 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
     // which matches the stable Shadowsocks flow and avoids VLESS-specific regressions.
     #[cfg(not(target_os = "linux"))]
     if matches!(desired_mode, RoutingMode::Tun) {
+        // Windows: TUN requires admin. If not elevated, relaunch elevated and resume the connect flow.
+        #[cfg(target_os = "windows")]
+        {
+            if !is_elevated_windows() {
+                log::warn!("[CONNECT][WIN] TUN requested but process is not elevated. Relaunching with admin rights...");
+                // Ensure the config exists on disk so the elevated instance can find it by name.
+                if let Ok(manager) = ConfigManager::new() {
+                    let _ = manager.add_config(config.clone()).await;
+                }
+                // Pass only the config name (no secrets) and routing override.
+                let arg_proxy = format!(r#"--proxy-connect="{}""#, config.name.replace('"', "\""));
+                let arg_routing = "--set-routing=tun";
+                relaunch_elevated_with_args(&["--elevated-relaunch", arg_routing, &arg_proxy])?;
+                let _ = window.app_handle().exit(0);
+                return Ok(());
+            }
+        }
+
         // Do NOT start Rust proxy in TUN mode. Configure sing-box outbound directly to upstream.
         log::info!("[CONNECT] Routing mode is TUN — skipping local proxy, configuring sing-box outbound");
         // Export remote server for route exclusions (all OS)
@@ -820,22 +839,40 @@ pub async fn disconnect_vpn_silent() {
     let _ = manager.disconnect().await;
 }
 
-#[tauri::command]
-pub async fn get_status() -> String {
+async fn effective_status_string() -> String {
+    // Primary status: local proxy client (SystemProxy mode)
     let status = {
         let manager = PROXY_MANAGER.lock().await;
         manager.get_status().await
     };
-    
-    let status_str = match status {
+    let mut status_str = match status {
         ConnectionStatus::Disconnected => "disconnected",
         ConnectionStatus::Connecting => "connecting",
         ConnectionStatus::Connected => "connected",
         ConnectionStatus::Error(_) => "error",
-    };
-    
+    }
+    .to_string();
+
+    // In TUN direct-outbound mode we may not have a ProxyClient at all, but TUN can still be running.
+    // Treat running TUN as "connected" so the frontend can show Disconnect and status correctly.
+    if status_str == "disconnected" {
+        let tun_running = {
+            let tun_manager = TUN_MANAGER.lock().await;
+            tun_manager.is_running()
+        };
+        if tun_running {
+            status_str = "connected".to_string();
+        }
+    }
+
+    status_str
+}
+
+#[tauri::command]
+pub async fn get_status() -> String {
+    let status_str = effective_status_string().await;
     log::info!("[STATUS] {}", status_str);
-    status_str.into()
+    status_str
 }
 
 #[tauri::command]
@@ -848,23 +885,13 @@ pub async fn start_connection_monitoring(window: tauri::Window) -> Result<(), St
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
             
-            let current_status = {
-                let manager = PROXY_MANAGER.lock().await;
-                let status = manager.get_status().await;
-                
-                match status {
-                    ConnectionStatus::Disconnected => "disconnected",
-                    ConnectionStatus::Connecting => "connecting", 
-                    ConnectionStatus::Connected => "connected",
-                    ConnectionStatus::Error(_) => "error",
-                }
-            };
+            let current_status = effective_status_string().await;
             
             if current_status != last_status {
                 log::info!("[MONITOR] Status changed: {} -> {}", last_status, current_status);
                 
                 let _ = window.emit("status", StatusEvent {
-                    status: current_status.into(),
+                    status: current_status.clone().into(),
                 });
                 
                 last_status = current_status.to_string();
@@ -1223,6 +1250,17 @@ pub async fn clear_system_proxy() -> Result<(), String> {
 pub async fn enable_tun_mode(window: tauri::Window) -> Result<(), String> {
     log::info!("[TUN] Enabling TUN mode");
     println!("[STDOUT] TUN mode enable requested");
+
+    // Windows: TUN requires admin privileges. If we're not elevated, trigger an elevated relaunch.
+    #[cfg(target_os = "windows")]
+    {
+        if !is_elevated_windows() {
+            log::warn!("[TUN][WIN] enable_tun_mode requested but process is not elevated. Relaunching as admin...");
+            relaunch_elevated_with_args(&["--elevated-relaunch", "--set-routing=tun"])?;
+            let _ = window.app_handle().exit(0);
+            return Ok(());
+        }
+    }
     
     // Get current proxy status
     let status = {

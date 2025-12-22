@@ -8,9 +8,9 @@ use crate::outbound::factory::make_from_env;
 pub fn build_singbox_config(cfg: &TunConfig, socks_host: String, socks_port: u16) -> Result<PathBuf> {
     use std::net::{IpAddr, ToSocketAddrs};
 
-    // For Linux we default sing-box log level to "warn",
-    // on other platforms we keep "info". Can be overridden via SB_LOG_LEVEL.
-    let default_log_level = if cfg!(target_os = "linux") { "warn" } else { "info" };
+    // Default sing-box log level to "warn" to avoid noisy per-connection TUN logs.
+    // Can be overridden via SB_LOG_LEVEL.
+    let default_log_level = "warn";
     let sb_log_level =
         std::env::var("SB_LOG_LEVEL").unwrap_or_else(|_| default_log_level.to_string());
     log::info!("[SING-BOX][CONFIG] Building sing-box config (log.level={sb_log_level}, socks={socks_host}:{socks_port})");
@@ -27,14 +27,24 @@ pub fn build_singbox_config(cfg: &TunConfig, socks_host: String, socks_port: u16
     if let Ok(host) = std::env::var("SS_REMOTE_HOST") {
         let port: u16 = std::env::var("SS_REMOTE_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(443);
         if let Ok(ip) = host.parse::<IpAddr>() {
-            if let IpAddr::V4(v4) = ip { direct_cidrs.push(format!("{}/32", v4)); }
+            match ip {
+                IpAddr::V4(v4) => direct_cidrs.push(format!("{}/32", v4)),
+                IpAddr::V6(v6) => direct_cidrs.push(format!("{}/128", v6)),
+            }
         } else if let Ok(iter) = (host.as_str(), port).to_socket_addrs() {
             use std::collections::BTreeSet;
             let mut seen = BTreeSet::new();
             for sa in iter {
-                if let IpAddr::V4(v4) = sa.ip() {
-                    if seen.insert(v4) { direct_cidrs.push(format!("{}/32", v4)); }
-                    if seen.len() >= 8 { break; }
+                match sa.ip() {
+                    IpAddr::V4(v4) => {
+                        // Prefer IPv4 for consistency with existing CIDR rules.
+                        if seen.insert(IpAddr::V4(v4)) { direct_cidrs.push(format!("{}/32", v4)); }
+                        if seen.len() >= 8 { break; }
+                    }
+                    IpAddr::V6(v6) => {
+                        if seen.insert(IpAddr::V6(v6)) { direct_cidrs.push(format!("{}/128", v6)); }
+                        if seen.len() >= 8 { break; }
+                    }
                 }
             }
         }

@@ -1,12 +1,18 @@
 {
-    "app": {
-      "windows": [
-        {
-          "additionalBrowserArgs": "--no-sandbox"
-        }
-      ]
-    },
-  
+  "app": {
+    "windows": [
+      {
+        "additionalBrowserArgs": "--no-sandbox",
+        "title": "CrabSock",
+        "width": 1100,
+        "height": 1000,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
     "bundle": {
       "resources": [
         "resources/sing-box/sing-box.exe",
