@@ -84,6 +84,62 @@ npm run tauri:dev
 npm run tauri:build
 ```
 
+### AppImage notes (Linux)
+
+If AppImage bundling fails with `failed to bundle project: ... build_appimage.sh`, run the script manually to see the real error:
+
+```bash
+cd src-tauri/target/release/bundle/appimage
+bash -x ./build_appimage.sh
+```
+
+Most common causes:
+- **No network access**: the script downloads `linuxdeploy` / `AppRun` / `linuxdeploy-plugin-gtk` into `~/.cache/tauri/`.
+- **Missing `wget`**: install it and re-run.
+- **Bad permissions** (cache/target owned by root): do not run `tauri build` via `sudo`, and fix ownership:
+
+```bash
+sudo chown -R "$USER:$USER" ~/.cache/tauri src-tauri/target
+```
+
+On some distros (e.g. Arch) linuxdeploy's embedded `strip` may fail with:
+`unknown type [0x13] section '.relr.dyn'`. Workaround:
+
+```bash
+export NO_STRIP=1
+```
+
+## Auto-updater (GitHub Releases)
+
+CrabSock is hosted on GitHub Releases and uses a single manifest file `latest.json`.
+
+- **Updater endpoint** (configured in `src-tauri/tauri.conf.json`):
+  - `https://github.com/Victorlerner/CrabSock/releases/latest/download/latest.json`
+- **Signing keys**:
+  - Generate once: `tauri signer generate`
+  - Keep the **private key** local (signs installers), put the **public key** into `plugins.updater.pubkey` in `src-tauri/tauri.conf.json`.
+  - For Tauri v2 builds that automatically generate updater signatures/artifacts, export env vars (plain shell export; `.env` files do not work):
+    - `TAURI_SIGNING_PRIVATE_KEY` (path **or** content of private key)
+    - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` (optional)
+
+### Generate `latest.json` (helper command)
+
+We keep an example input at `scripts/latest-input.example.json`.
+
+1. Fill it with your release `version`, `tag`, `notes`, and per-platform `{ file, signature }`.
+2. Generate:
+
+```bash
+npm run updater:latest-json -- --in scripts/latest-input.example.json --out latest.json
+```
+
+Upload the resulting `latest.json` to the same GitHub Release as an asset named **exactly** `latest.json`.
+
+Notes:
+- For Linux we build `.deb` and `.rpm` (manual install) and optionally `appimage` (best for auto-update).
+- `.sig` files are generated for **updater artifacts** only when `bundle.createUpdaterArtifacts` is enabled (see `src-tauri/tauri.conf.json`); they may **not** appear next to `.deb/.rpm`.
+- The manifest can carry multiple Linux entries (e.g. `linux-x86_64-appimage`, `linux-x86_64-deb`, `linux-x86_64-rpm`), but only the key matching the running platform is used by the updater.
+
 2. Run (Linux, Wayland/X11 compatibility):
 ```bash
 WEBKIT_DISABLE_DMABUF_RENDERER=1 ./src-tauri/target/release/crab-sock

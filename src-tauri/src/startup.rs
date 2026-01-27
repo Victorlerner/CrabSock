@@ -196,15 +196,15 @@ pub fn activate_main_window(app: &tauri::AppHandle) {
 
 /// Build the base Tauri builder, attaching the single-instance plugin when appropriate.
 pub fn build_tauri_builder(elevated_relaunch: bool) -> tauri::Builder<tauri::Wry> {
+    let base = tauri::Builder::default().plugin(tauri_plugin_updater::Builder::new().build());
+
     if elevated_relaunch {
-        tauri::Builder::default()
+        base
     } else {
-        tauri::Builder::default().plugin(tauri_plugin_single_instance::init(
-            |app, _argv, _cwd| {
-                // Focus already running instance instead of spawning a new one
-                activate_main_window(&app.app_handle());
-            },
-        ))
+        base.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            // Focus already running instance instead of spawning a new one
+            activate_main_window(&app.app_handle());
+        }))
     }
 }
 

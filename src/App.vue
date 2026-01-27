@@ -8,11 +8,21 @@ import LogsPanel from '@src/components/LogsPanel.vue'
 import ConnectionStatus from '@src/components/ConnectionStatus.vue'
 import Settings from '@src/components/Settings.vue'
 import OpenVpnSection from '@src/components/OpenVpnSection.vue'
-import { onMounted } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useVpnStore } from '@src/stores/vpnStore'
+import { getVersion } from '@tauri-apps/api/app'
 
 const store = useVpnStore()
-onMounted(() => store.init())
+const appVersion = ref<string>('')
+
+onMounted(async () => {
+  store.init()
+  try {
+    appVersion.value = await getVersion()
+  } catch {
+    // ignore (e.g., running in pure web mode)
+  }
+})
 </script>
 
 <template>
@@ -22,7 +32,10 @@ onMounted(() => store.init())
         <img src="/app-icon.png" alt="App icon" class="w-12 h-12 sm:w-14 sm:h-14 md:w-16 md:h-16 shrink-0" />
         <div class="flex items-center gap-2">
          
-          <h1 class="text-2xl font-semibold">CrabSock</h1>
+          <h1 class="text-2xl font-semibold">
+            CrabSock
+            <span v-if="appVersion" class="ml-2 text-sm font-medium text-gray-500 dark:text-gray-400">v{{ appVersion }}</span>
+          </h1>
         </div>
         <IpFlag />
       </header>
@@ -45,11 +58,6 @@ onMounted(() => store.init())
             <ConfigInput />
           </section>
 
-
-          <!-- Connect Button -->
-<!--          <section  v-if="!store.showConfig" class="flex items-center gap-3">-->
-<!--            <ConnectButton />-->
-<!--          </section>-->
           <OpenVpnSection />
         </div>
 
