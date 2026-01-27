@@ -12,6 +12,7 @@ use tauri::Emitter;
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
 use tauri::menu::{Menu, MenuItem};
 use startup::activate_main_window;
+use tauri_plugin_updater::UpdaterExt;
 
 fn main() {
     // On Linux disable WebKitGTK DMA-BUF renderer to avoid GPU/DRM permission issues when using capabilities/elevation
@@ -113,6 +114,38 @@ fn main() {
 
     builder
         .setup(move |app| {
+            // Auto-check updates on startup and log the result (no UI required).
+            {
+                let app_handle = app.handle().clone();
+                let current_version = app.package_info().version.to_string();
+                tauri::async_runtime::spawn(async move {
+                    log::info!("[UPDATER] Checking for updates (current v{})...", current_version);
+                    match app_handle.updater() {
+                        Ok(updater) => match updater.check().await {
+                            Ok(Some(update)) => {
+                                log::info!(
+                                    "[UPDATER] Update available: v{} (current v{})",
+                                    update.version,
+                                    current_version
+                                );
+                            }
+                            Ok(None) => {
+                                log::info!(
+                                    "[UPDATER] No updates available (current v{})",
+                                    current_version
+                                );
+                            }
+                            Err(e) => {
+                                log::warn!("[UPDATER] Update check failed: {}", e);
+                            }
+                        },
+                        Err(e) => {
+                            log::warn!("[UPDATER] Updater init failed: {}", e);
+                        }
+                    };
+                });
+            }
+
             // Create tray icon and handle clicks to show window
             let icon = app.default_window_icon().cloned().expect("default window icon missing");
             // Tray menu

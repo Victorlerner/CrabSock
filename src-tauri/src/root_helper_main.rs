@@ -13,8 +13,11 @@
 //! Helper is expected to be installed as setuid-root and owned by root.
 
 use std::env;
+use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::process::{Command, ExitCode};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const HELPER_VERSION: &str = "1";
 
@@ -91,7 +94,78 @@ fn main() -> ExitCode {
                 return ExitCode::from(1);
             }
 
-            let status = match Command::new(&bin_path)
+            // IMPORTANT: do not execute the sing-box binary directly from app resources.
+            // During `tauri build` those resource files may be overwritten; if a process is
+            // executing the same file, Linux can fail with `Text file busy (os error 26)`.
+            // Fix: copy to a unique temp path and execute from there.
+            let bin_meta = match fs::symlink_metadata(bin) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!(
+                        "crabsock-root-helper: failed to stat sing-box binary: {}: {}",
+                        bin_path, e
+                    );
+                    return ExitCode::from(1);
+                }
+            };
+            if bin_meta.file_type().is_symlink() {
+                eprintln!(
+                    "crabsock-root-helper: refusing to execute symlink as sing-box binary: {}",
+                    bin_path
+                );
+                return ExitCode::from(1);
+            }
+
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let tmp_bin_path = format!("/tmp/crabsock-sing-box-{}-{}", std::process::id(), nonce);
+            let tmp_bin = Path::new(&tmp_bin_path);
+
+            // Secure-ish copy: create_new to avoid clobbering, then stream bytes.
+            let mut src = match fs::File::open(bin) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!(
+                        "crabsock-root-helper: failed to open sing-box binary for copy: {}: {}",
+                        bin_path, e
+                    );
+                    return ExitCode::from(1);
+                }
+            };
+            let mut dst = match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(tmp_bin)
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!(
+                        "crabsock-root-helper: failed to create temp sing-box binary: {}: {}",
+                        tmp_bin_path, e
+                    );
+                    return ExitCode::from(1);
+                }
+            };
+            if let Err(e) = std::io::copy(&mut src, &mut dst) {
+                eprintln!(
+                    "crabsock-root-helper: failed to copy sing-box to temp path: {} -> {}: {}",
+                    bin_path, tmp_bin_path, e
+                );
+                let _ = fs::remove_file(tmp_bin);
+                return ExitCode::from(1);
+            }
+            let _ = dst.flush();
+
+            // Make it executable (ignore failure; if it fails, exec will fail and report).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(tmp_bin, fs::Permissions::from_mode(0o755));
+            }
+
+            let status = match Command::new(&tmp_bin_path)
                 .args(["run", "-c", &cfg_path, "--disable-color"])
                 .spawn()
                 .and_then(|mut child| child.wait())
@@ -99,9 +173,13 @@ fn main() -> ExitCode {
                 Ok(status) => status,
                 Err(e) => {
                     eprintln!("crabsock-root-helper: failed to start sing-box: {}", e);
+                    let _ = fs::remove_file(tmp_bin);
                     return ExitCode::from(1);
                 }
             };
+
+            // Best-effort cleanup
+            let _ = fs::remove_file(tmp_bin);
 
             if let Some(code) = status.code() {
                 ExitCode::from(code as u8)
