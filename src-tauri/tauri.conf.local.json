@@ -1,0 +1,52 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "CrabSock",
+  "version": "0.1.0",
+  "identifier": "dev.crabsock.app",
+  "build": {
+    "beforeBuildCommand": "vite build",
+    "beforeDevCommand": "vite",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "additionalBrowserArgs": "--no-sandbox",
+        "title": "CrabSock",
+        "width": 1100,
+        "height": 1000,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["deb", "rpm", "app", "dmg", "msi"],
+    "createUpdaterArtifacts": false,
+    "macOS": {
+      "entitlements": "macos/host.entitlements"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "dialog": true,
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDc5QzczQkFGMzI5RjJBNEIKUldSTEtwOHlyenZIZVI3ZWVxYVhZcXpQZTNJRGZ3Q2J2ZmxKeGloL2ZSWnZ4Z3ZvYmx2SE1CRXcK",
+      "endpoints": [
+        "https://github.com/Victorlerner/CrabSock/releases/latest/download/latest.json"
+      ]
+    }
+  }
+}
+
+
