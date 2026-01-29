@@ -568,8 +568,8 @@ impl OpenVpnManager {
             }
         };
 
-        #[cfg(not(target_os = "linux"))]
-        let (spawn_exe, used_helper_flag) = (exe.clone(), false);
+        #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
+        let spawn_exe = exe.clone();
 
         // Spawn process (Windows: require app to be elevated; do not self-elevate OpenVPN)
         #[cfg(target_os = "windows")]

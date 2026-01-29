@@ -9,6 +9,7 @@ use once_cell::sync::Lazy;
 use tokio::sync::Mutex;
 use serde::Serialize;
 use tauri::Emitter;
+use tauri::Manager;
 #[cfg(target_os = "windows")]
 use std::process::Stdio;
 #[cfg(target_os = "windows")]

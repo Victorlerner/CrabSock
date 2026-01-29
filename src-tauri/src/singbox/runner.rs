@@ -94,7 +94,6 @@ pub fn find_singbox_path() -> Option<PathBuf> {
 
 #[cfg(target_os = "windows")]
 pub fn spawn_singbox(singbox_path: &Path, cfg_path: &Path) -> Result<tokio::process::Child> {
-    use std::os::windows::process::CommandExt as _;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
     let mut child = Command::new(singbox_path)
         .creation_flags(CREATE_NO_WINDOW)
