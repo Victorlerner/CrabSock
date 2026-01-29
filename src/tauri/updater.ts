@@ -1,21 +1,43 @@
-// Frontend wrapper around Tauri v2 updater plugin.
-// Keeps Vue components decoupled from the plugin API and makes "web mode" safe.
+// Frontend wrapper around Tauri v2 updater.
+// Keeps Vue components decoupled from the backend implementation.
 
-import { check as pluginCheck } from '@tauri-apps/plugin-updater'
+import { invoke } from '@tauri-apps/api/core'
+import { isTauri } from '@tauri-apps/api/core'
 
-function isTauriRuntime(): boolean {
-  // Tauri v2 exposes internal bridge on window.__TAURI_INTERNALS__
-  return typeof window !== 'undefined' && !!(window as any).__TAURI_INTERNALS__
+export interface UpdateInfo {
+  available: boolean
+  version?: string
+  current_version: string
+  body?: string
+  date?: string
 }
 
-export async function check() {
-  if (!isTauriRuntime()) return null
+export async function check(): Promise<UpdateInfo | null> {
+  // In pure web mode the updater is unavailable.
+  if (typeof window === 'undefined' || !isTauri()) return null
 
   try {
-    return await pluginCheck()
-  } catch {
-    // If updater isn't available (e.g. dev/web context) treat as "no update".
-    return null
+    const result = await invoke<UpdateInfo>('check_for_updates')
+    console.log('[UPDATER] Backend check result:', result)
+    return result
+  } catch (error) {
+    console.error('[UPDATER] Backend check failed:', error)
+    throw error
+  }
+}
+
+export async function downloadAndInstall(): Promise<void> {
+  if (typeof window === 'undefined' || !isTauri()) {
+    throw new Error('Not in Tauri environment')
+  }
+
+  try {
+    console.log('[UPDATER] Starting download and install...')
+    await invoke('download_and_install_update')
+    console.log('[UPDATER] Download and install completed')
+  } catch (error) {
+    console.error('[UPDATER] Download/install failed:', error)
+    throw error
   }
 }
 

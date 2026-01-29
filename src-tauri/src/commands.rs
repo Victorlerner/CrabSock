@@ -17,7 +17,6 @@ use std::os::windows::process::CommandExt;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 use crate::openvpn;
 use crate::openvpn::{OpenVpnManager, OpenVpnConfigInfo};
-use tauri::Manager;
 
 #[cfg(target_os = "macos")]
 fn is_root_macos() -> bool {
@@ -313,6 +312,7 @@ pub async fn connect_vpn(window: tauri::Window, config: ProxyConfig) -> Result<(
     log::info!("[CONNECT] Starting VPN connection with config: {:?}", config.masked());
 
     // Read desired routing mode upfront to decide whether to start local proxy or go straight to TUN
+    #[allow(unused_variables)]
     let desired_mode = ConfigManager::new()
         .map_err(|e| e.to_string())?
         .load_configs().await
@@ -1412,5 +1412,112 @@ pub async fn disable_tun_mode() -> Result<(), String> {
 pub async fn is_tun_mode_enabled() -> Result<bool, String> {
     let system_manager = SYSTEM_PROXY_MANAGER.lock().await;
     Ok(system_manager.is_tun_mode())
+}
+
+#[derive(Serialize)]
+pub struct UpdateInfo {
+    pub available: bool,
+    pub version: Option<String>,
+    pub current_version: String,
+    pub body: Option<String>,
+    pub date: Option<String>,
+}
+
+#[tauri::command]
+pub async fn check_for_updates(app: tauri::AppHandle) -> Result<UpdateInfo, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    
+    let current_version = app.package_info().version.to_string();
+    log::info!("[UPDATER] Frontend-triggered check (current v{})...", current_version);
+    
+    match app.updater() {
+        Ok(updater) => match updater.check().await {
+            Ok(Some(update)) => {
+                log::info!("[UPDATER] Update available: v{}", update.version);
+                Ok(UpdateInfo {
+                    available: true,
+                    version: Some(update.version),
+                    current_version,
+                    body: update.body,
+                    date: update.date.map(|d| d.to_string()),
+                })
+            }
+            Ok(None) => {
+                log::info!("[UPDATER] No updates available");
+                Ok(UpdateInfo {
+                    available: false,
+                    version: None,
+                    current_version,
+                    body: None,
+                    date: None,
+                })
+            }
+            Err(e) => {
+                log::warn!("[UPDATER] Update check failed: {}", e);
+                Err(format!("Update check failed: {}", e))
+            }
+        },
+        Err(e) => {
+            log::warn!("[UPDATER] Updater init failed: {}", e);
+            Err(format!("Updater init failed: {}", e))
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn download_and_install_update(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_updater::UpdaterExt;
+    
+    let current_version = app.package_info().version.to_string();
+    log::info!("[UPDATER] Starting download and install (current v{})...", current_version);
+    
+    match app.updater() {
+        Ok(updater) => match updater.check().await {
+            Ok(Some(update)) => {
+                log::info!("[UPDATER] Update found: v{}", update.version);
+                log::info!("[UPDATER] Current version: v{}", update.current_version);
+                log::info!("[UPDATER] Update date: {:?}", update.date);
+                log::info!("[UPDATER] Update body: {}", update.body.as_deref().unwrap_or("(none)"));
+                
+                log::info!("[UPDATER] Starting download...");
+                
+                match update.download_and_install(|chunk_length, content_length| {
+                    if let Some(total) = content_length {
+                        let percent = (chunk_length as f64 / total as f64) * 100.0;
+                        if chunk_length % 524288 == 0 || chunk_length as u64 == total {
+                            // Log every 512KB or at completion
+                            log::info!("[UPDATER] Download progress: {}/{} bytes ({:.1}%)", chunk_length, total, percent);
+                        }
+                    } else {
+                        log::debug!("[UPDATER] Downloaded {} bytes (total unknown)", chunk_length);
+                    }
+                }, || {
+                    log::info!("[UPDATER] Download completed, verifying signature and installing...");
+                }).await {
+                    Ok(_) => {
+                        log::info!("[UPDATER] Update installed successfully. Restart required.");
+                        Ok(())
+                    }
+                    Err(e) => {
+                        log::error!("[UPDATER] Download/install failed: {}", e);
+                        log::error!("[UPDATER] Error details: {:?}", e);
+                        Err(format!("Download/install failed: {}", e))
+                    }
+                }
+            }
+            Ok(None) => {
+                log::info!("[UPDATER] No updates available to download");
+                Err("No updates available".to_string())
+            }
+            Err(e) => {
+                log::warn!("[UPDATER] Update check failed: {}", e);
+                Err(format!("Update check failed: {}", e))
+            }
+        },
+        Err(e) => {
+            log::warn!("[UPDATER] Updater init failed: {}", e);
+            Err(format!("Updater init failed: {}", e))
+        }
+    }
 }
 

@@ -15,7 +15,7 @@
     "tauri:build": " npm run icons:all && tauri build -- -j 8",
     "tauri:build:linux": "NO_STRIP=1 WEBKIT_DISABLE_DMABUF_RENDERER=1  npm run icons:all && tauri build",
     "arch:build": "cd arch && makepkg -si --noconfirm",
-    "updater:latest-json": "node scripts/generate-latest-json.mjs"
+    "updater:latest-json": "node scripts/generate-latest-json.mjs --in scripts/latest-input.example.json --out latest.json"
   },
   "dependencies": {
     "@tauri-apps/api": "2.0.0",

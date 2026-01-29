@@ -306,6 +306,8 @@ fn main() {
             enable_tun_mode,
             disable_tun_mode,
             is_tun_mode_enabled,
+            check_for_updates,
+            download_and_install_update,
             // OpenVPN
             openvpn_list_configs,
             openvpn_add_config,

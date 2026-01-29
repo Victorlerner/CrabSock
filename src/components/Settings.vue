@@ -2,7 +2,7 @@
 import { onMounted, ref, computed, watch } from 'vue'
 import { useVpnStore } from '@src/stores/vpnStore'
 import { getVersion } from '@tauri-apps/api/app'
-import { check } from '@src/tauri/updater'
+import { check, downloadAndInstall } from '@src/tauri/updater'
 
 const store = useVpnStore()
 const osPlatform = ref<'windows' | 'linux' | 'macos' | 'unknown'>('unknown')
@@ -11,6 +11,7 @@ const appVersion = ref<string>('')
 
 const updateState = ref<'idle' | 'checking' | 'available' | 'downloading' | 'installed' | 'none' | 'error'>('idle')
 const updateMessage = ref<string>('')
+const updateVersion = ref<string>('')
 
 function detectPlatform(): 'windows' | 'linux' | 'macos' | 'unknown' {
   const ua = navigator.userAgent.toLowerCase()
@@ -79,38 +80,51 @@ async function checkForUpdates() {
   updateState.value = 'checking'
 
   try {
-    const res: any = await check()
+    const res = await check()
+    
+    console.log('[UPDATER] Check result:', res)
 
-    // plugin-updater v2: returns null if no update is available
     if (!res) {
-      updateState.value = 'none'
-      updateMessage.value = 'No updates available.'
+      updateState.value = 'error'
+      updateMessage.value = 'Failed to check for updates (web mode?).'
+      console.log('[UPDATER] No result from backend')
       return
     }
 
-    // Some versions may return an object with `available: boolean`
-    if (typeof res.available === 'boolean' && !res.available) {
+    if (!res.available) {
       updateState.value = 'none'
-      updateMessage.value = 'No updates available.'
+      updateMessage.value = `No updates available (current: v${res.current_version}).`
+      console.log('[UPDATER] No updates available')
       return
     }
 
+    // Update is available
     updateState.value = 'available'
-    updateMessage.value = `Update available${res.version ? `: v${res.version}` : ''}. Downloading...`
-
-    updateState.value = 'downloading'
-    if (typeof res.downloadAndInstall === 'function') {
-      await res.downloadAndInstall()
-    } else if (typeof res.download === 'function' && typeof res.install === 'function') {
-      await res.download()
-      await res.install()
-    }
-
-    updateState.value = 'installed'
-    updateMessage.value = 'Update installed. Restart the app to apply it.'
+    updateVersion.value = res.version || ''
+    updateMessage.value = `Update available: v${res.version} (current v${res.current_version}). Click "Install Update" to download and install.`
+    console.log('[UPDATER] Update available:', res.version)
   } catch (e: any) {
+    console.error('[UPDATER] Check failed:', e)
     updateState.value = 'error'
     updateMessage.value = `Update check failed: ${e?.message ?? String(e)}`
+  }
+}
+
+async function installUpdate() {
+  updateState.value = 'downloading'
+  updateMessage.value = `Downloading update v${updateVersion.value}...`
+
+  try {
+    console.log('[UPDATER] Starting download and install...')
+    await downloadAndInstall()
+    
+    updateState.value = 'installed'
+    updateMessage.value = 'Update installed successfully! Please restart the application to apply the update.'
+    console.log('[UPDATER] Update installed, restart required')
+  } catch (e: any) {
+    console.error('[UPDATER] Install failed:', e)
+    updateState.value = 'error'
+    updateMessage.value = `Update installation failed: ${e?.message ?? String(e)}`
   }
 }
 
@@ -147,18 +161,28 @@ onMounted(init)
           App version
           <span v-if="appVersion" class="ml-2 text-xs font-normal text-gray-500 dark:text-gray-400">v{{ appVersion }}</span>
         </div>
-        <button
-          type="button"
-          class="px-3 py-2 rounded-md bg-gray-900 text-white text-sm hover:bg-gray-800 disabled:opacity-50 disabled:cursor-not-allowed dark:bg-neutral-100 dark:text-neutral-900 dark:hover:bg-white"
-          :disabled="updateState === 'checking' || updateState === 'downloading'"
-          @click="checkForUpdates"
-        >
-          <span v-if="updateState === 'checking'">Checking...</span>
-          <span v-else-if="updateState === 'downloading'">Updating...</span>
-          <span v-else>Check updates</span>
-        </button>
+        <div class="flex gap-2">
+          <button
+            v-if="updateState === 'available'"
+            type="button"
+            class="px-3 py-2 rounded-md bg-green-600 text-white text-sm hover:bg-green-700"
+            @click="installUpdate"
+          >
+            Install Update
+          </button>
+          <button
+            type="button"
+            class="px-3 py-2 rounded-md bg-gray-900 text-white text-sm hover:bg-gray-800 disabled:opacity-50 disabled:cursor-not-allowed dark:bg-neutral-100 dark:text-neutral-900 dark:hover:bg-white"
+            :disabled="updateState === 'checking' || updateState === 'downloading' || updateState === 'installed'"
+            @click="checkForUpdates"
+          >
+            <span v-if="updateState === 'checking'">Checking...</span>
+            <span v-else-if="updateState === 'downloading'">Downloading...</span>
+            <span v-else>Check updates</span>
+          </button>
+        </div>
       </div>
-      <div v-if="updateMessage" class="mt-2 text-xs text-gray-600 dark:text-gray-400">
+      <div v-if="updateMessage" class="mt-2 text-xs" :class="updateState === 'error' ? 'text-red-600 dark:text-red-400' : updateState === 'installed' ? 'text-green-600 dark:text-green-400' : 'text-gray-600 dark:text-gray-400'">
         {{ updateMessage }}
       </div>
     </div>
